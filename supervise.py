@@ -105,10 +105,18 @@ class PRState:
     error: Optional[str] = None
 
 
-_WATCH_SKIP = frozenset({
+_WATCH_SKIP_DIRS = frozenset({
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     "target", "_build", "dist", "build",
     ".mypy_cache", ".ruff_cache", ".pytest_cache",
+    ".deno", ".gradle", ".npm", ".cache",
+    "coverage", ".nyc_output", ".turbo", ".next", ".nuxt",
+})
+
+_WATCH_SKIP_FILES = frozenset({
+    "deno.lock", "package-lock.json", "pnpm-lock.yaml",
+    "yarn.lock", "Cargo.lock", "mix.lock", "uv.lock",
+    "poetry.lock", "Gemfile.lock", "go.sum", "composer.lock",
 })
 
 
@@ -177,8 +185,10 @@ class Supervisor:
         mtimes: dict = {}
         try:
             for root, dirs, files in os.walk(self.target):
-                dirs[:] = [d for d in dirs if d not in _WATCH_SKIP]
+                dirs[:] = [d for d in dirs if d not in _WATCH_SKIP_DIRS]
                 for f in files:
+                    if f in _WATCH_SKIP_FILES:
+                        continue
                     p = Path(root) / f
                     try:
                         mtimes[str(p)] = p.stat().st_mtime
@@ -194,11 +204,12 @@ class Supervisor:
         prev = self._scan_mtimes()
         self._run_tests()
         while not self._stop.is_set():
-            self._stop.wait(1)
+            self._stop.wait(2)
             curr = self._scan_mtimes()
             if curr != prev:
-                prev = curr
+                prev = self._scan_mtimes()  # rescan after any settle
                 self._run_tests()
+                self._stop.wait(10)         # cooldown: ignore churn from the run itself
 
     def _run_tests(self):
         with self._lock:
