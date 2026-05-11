@@ -349,7 +349,15 @@ def render(sup: Supervisor) -> Panel:
                 v.append(time_ago(tests.last_run), style="dim")
             tbl.add_row(_sym("bad"), v)
 
-    # ─ gh/pr ─────────────────────────────────────────────────────────────────
+    # ─ gh/pr (own table so test output can be inserted above it) ─────────────
+    pr_tbl = Table(
+        show_header=False, box=None,
+        pad_edge=False, show_edge=False,
+        padding=(0, 2, 0, 0),
+        expand=True,
+    )
+    pr_tbl.add_column("sym",   width=1,  no_wrap=True, min_width=1, max_width=1)
+    pr_tbl.add_column("value", ratio=1,  no_wrap=True, overflow="ellipsis")
     v = Text()
     if prs.fetching and prs.last_fetch is None:
         v.append(_elapsed(prs.fetch_started), style="dim")
@@ -370,14 +378,17 @@ def render(sup: Supervisor) -> Panel:
             if author:
                 v.append(f"  {author}", style="dim")
         pr_sym = _sym("")
-    tbl.add_row(pr_sym, v)
+    pr_tbl.add_row(pr_sym, v)
 
-    # ─ body: test output or git status ───────────────────────────────────────
+    # ─ assemble: test failures appear above PR list ───────────────────────────
+    test_failed = tests.cmd and not tests.running and tests.passed is False
     parts: list = [header, Text(""), tbl]
-    if tests.cmd and not tests.running and tests.passed is False and tests.output:
+    if test_failed and tests.output:
         parts.append(Rule(style="dim red"))
         parts.append(Text(tests.output, style="dim"))
-    elif git.dirty and git.status_output:
+        parts.append(Rule(style="dim red"))
+    parts.append(pr_tbl)
+    if not test_failed and git.dirty and git.status_output:
         parts.append(Rule(style="dim yellow"))
         parts.append(Text(git.status_output.rstrip(), style="dim"))
 
