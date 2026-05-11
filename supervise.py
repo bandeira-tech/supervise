@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""supervise — continuous project status dashboard"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
+from rich import box
+
+
+def run(cmd: list[str], cwd=None, timeout=60) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def detect_test_cmd(target: Path) -> Optional[list[str]]:
+    if (target / "deno.json").exists() or (target / "deno.jsonc").exists():
+        fname = "deno.json" if (target / "deno.json").exists() else "deno.jsonc"
+        try:
+            cfg = json.loads((target / fname).read_text())
+            if "test" in cfg.get("tasks", {}):
+                return ["deno", "task", "test"]
+        except Exception:
+            pass
+        return ["deno", "test"]
+    if (target / "mix.exs").exists():
+        return ["mix", "test"]
+    if (target / "Cargo.toml").exists():
+        return ["cargo", "test"]
+    if (target / "go.mod").exists():
+        return ["go", "test", "./..."]
+    if (target / "package.json").exists():
+        try:
+            pkg = json.loads((target / "package.json").read_text())
+            if "test" in pkg.get("scripts", {}):
+                if (target / "pnpm-lock.yaml").exists():
+                    return ["pnpm", "test", "--", "--run"]
+                elif (target / "yarn.lock").exists():
+                    return ["yarn", "test", "--watchAll=false"]
+                return ["npm", "test", "--", "--watchAll=false"]
+        except Exception:
+            pass
+    for f in ("pytest.ini", "pyproject.toml", "setup.cfg"):
+        if (target / f).exists():
+            return ["python", "-m", "pytest", "--tb=short", "-q"]
+    if (target / "Makefile").exists():
+        rc, _, _ = run(["make", "-n", "test"], cwd=target, timeout=5)
+        if rc == 0:
+            return ["make", "test"]
+    return None
+
+
+@dataclass
+class GitState:
+    branch: str = "?"
+    dirty: bool = False
+    status_output: str = ""
+    commit_msg: str = ""
+    commit_time: Optional[datetime] = None
+    remote_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class TestState:
+    cmd: Optional[list[str]] = None
+    running: bool = False
+    run_started: Optional[datetime] = None
+    passed: Optional[bool] = None
+    output: str = ""
+    last_run: Optional[datetime] = None
+    duration: float = 0.0
+    count: Optional[str] = None  # e.g. "42 passed" or "38 passed, 4 failed"
+
+
+@dataclass
+class PRState:
+    prs: list = field(default_factory=list)
+    last_fetch: Optional[datetime] = None
+    fetching: bool = False
+    fetch_started: Optional[datetime] = None
+    error: Optional[str] = None
+
+
+class Supervisor:
+    def __init__(self, target: Path, test_interval: int, pr_interval: int):
+        self.target = target.resolve()
+        self.test_interval = test_interval
+        self.pr_interval = pr_interval
+        self._lock = threading.Lock()
+        self.git = GitState()
+        self.tests = TestState(cmd=detect_test_cmd(target))
+        self.prs = PRState()
+        self._stop = threading.Event()
+        self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
+
+    def start(self):
+        for fn in (self._git_loop, self._test_loop, self._pr_loop):
+            t = threading.Thread(target=fn, daemon=True)
+            t.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _git_loop(self):
+        while not self._stop.is_set():
+            g = GitState()
+            rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.target)
+            if rc != 0:
+                g.error = "not a git repo"
+            else:
+                g.branch = out.strip()
+                _, status, _ = run(["git", "status", "--porcelain"], cwd=self.target)
+                g.dirty = bool(status.strip())
+                g.status_output = status
+                _, log, _ = run(
+                    ["git", "log", "-1", "--format=%s\x1f%ct"],
+                    cwd=self.target,
+                )
+                if log.strip():
+                    parts = log.strip().split("\x1f")
+                    g.commit_msg = parts[0]
+                    if len(parts) > 1:
+                        try:
+                            g.commit_time = datetime.fromtimestamp(int(parts[1]), tz=timezone.utc)
+                        except ValueError:
+                            pass
+                if self._remote_url is None:
+                    _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
+                    self._remote_url = _parse_github_url(remote.strip()) or ""
+                g.remote_url = self._remote_url or None
+            with self._lock:
+                self.git = g
+            self._stop.wait(2)
+
+    def _test_loop(self):
+        while not self._stop.is_set():
+            if not self.tests.cmd:
+                self._stop.wait(60)
+                continue
+            self._run_tests()
+            self._stop.wait(self.test_interval)
+
+    def _run_tests(self):
+        with self._lock:
+            if self.tests.running:
+                return
+            self.tests.running = True
+            self.tests.run_started = datetime.now(tz=timezone.utc)
+            cmd = self.tests.cmd
+
+        start = time.monotonic()
+        rc, stdout, stderr = run(cmd, cwd=self.target, timeout=300)
+        elapsed = time.monotonic() - start
+
+        combined = (stdout + stderr).strip()
+        lines = combined.splitlines()
+        if len(lines) > 80:
+            combined = "\n".join(lines[-80:])
+
+        # parse test count from output (x passed, y failed patterns)
+        test_count = _parse_test_counts(combined)
+
+        with self._lock:
+            self.tests.running = False
+            self.tests.run_started = None
+            self.tests.passed = rc == 0
+            self.tests.output = combined
+            self.tests.last_run = datetime.now(tz=timezone.utc)
+            self.tests.duration = elapsed
+            self.tests.count = test_count
+
+    def _pr_loop(self):
+        while not self._stop.is_set():
+            self._fetch_prs()
+            self._stop.wait(self.pr_interval)
+
+    def _fetch_prs(self):
+        with self._lock:
+            self.prs.fetching = True
+            self.prs.fetch_started = datetime.now(tz=timezone.utc)
+
+        rc, out, err = run(
+            ["gh", "pr", "list", "--json", "number,title,author,createdAt", "--limit", "10"],
+            cwd=self.target,
+            timeout=20,
+        )
+        p = PRState(last_fetch=datetime.now(tz=timezone.utc))
+        if rc == 0:
+            try:
+                p.prs = json.loads(out)
+            except Exception as e:
+                p.error = f"parse: {e}"
+        else:
+            p.error = (err or "gh failed").strip().splitlines()[0]
+
+        with self._lock:
+            self.prs = p
+
+    def snapshot(self):
+        with self._lock:
+            return self.git, self.tests, self.prs
+
+
+def _parse_github_url(remote: str) -> Optional[str]:
+    m = re.match(r"git@github\.com:(.+?)(?:\.git)?$", remote)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    m = re.match(r"https?://github\.com/(.+?)(?:\.git)?$", remote)
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    return None
+
+
+def _parse_test_counts(output: str) -> Optional[str]:
+    # Deno: "ok | 12 passed | 0 failed (123ms)"
+    m = re.search(r"(\d+) passed.*?(\d+) failed", output)
+    if m:
+        p, f = int(m.group(1)), int(m.group(2))
+        return f"{p}/{p+f}" if f == 0 else f"{p}/{p+f} ({f} failed)"
+    m = re.search(r"(\d+) passed", output)
+    if m:
+        return f"{m.group(1)} passed"
+    # pytest: "5 passed", "3 failed"
+    m = re.search(r"(\d+) failed", output)
+    if m:
+        p_m = re.search(r"(\d+) passed", output)
+        p = int(p_m.group(1)) if p_m else 0
+        f = int(m.group(1))
+        return f"{p}/{p+f} ({f} failed)"
+    # mix test: "1 test, 0 failures" or "5 tests, 2 failures"
+    m = re.search(r"(\d+) tests?, (\d+) failures?", output)
+    if m:
+        total, failures = int(m.group(1)), int(m.group(2))
+        passed = total - failures
+        return f"{passed}/{total}" if failures == 0 else f"{passed}/{total} ({failures} failed)"
+    return None
+
+
+def _elapsed(since: Optional[datetime]) -> str:
+    if since is None:
+        return ""
+    secs = max(0, int((datetime.now(tz=timezone.utc) - since).total_seconds()))
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+def time_ago(dt: Optional[datetime]) -> str:
+    if dt is None:
+        return "never"
+    now = datetime.now(tz=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    secs = max(0, int((now - dt).total_seconds()))
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def _sym(state: str) -> Text:
+    return {
+        "good": Text("✓", style="bold green"),
+        "bad":  Text("✗", style="bold red"),
+        "run":  Text("~", style="yellow"),
+    }.get(state, Text(" "))
+
+
+def render(sup: Supervisor) -> Panel:
+    git, tests, prs = sup.snapshot()
+    target = sup.target
+
+    home = Path.home()
+    try:
+        display = "~/" + str(target.relative_to(home))
+    except ValueError:
+        display = str(target)
+
+    header = Text(display, style="cyan")
+    if git.remote_url:
+        repo_label = git.remote_url.removeprefix("https://")
+        header.append(f"  {repo_label}", style=Style(color="bright_black", link=git.remote_url))
+
+    tbl = Table(
+        show_header=False, box=None,
+        pad_edge=False, show_edge=False,
+        padding=(0, 2, 0, 0),
+        expand=True,
+    )
+    tbl.add_column("sym",   width=1,  no_wrap=True, min_width=1, max_width=1)
+    tbl.add_column("value", ratio=1,  no_wrap=True, overflow="ellipsis")
+
+    # ─ git ───────────────────────────────────────────────────────────────────
+    if git.error:
+        tbl.add_row(_sym("bad"), Text(git.error, style="red"))
+    else:
+        v = Text(git.branch, style="yellow")
+        if git.commit_time:
+            v.append(f"  {time_ago(git.commit_time)}", style="dim")
+        if git.commit_msg:
+            v.append(f"  {git.commit_msg}", style="dim italic")
+        tbl.add_row(_sym("bad" if git.dirty else "good"), v)
+
+    # ─ tests ─────────────────────────────────────────────────────────────────
+    if tests.cmd is not None:
+        v = Text()
+        if tests.running:
+            v.append(_elapsed(tests.run_started), style="dim")
+            tbl.add_row(_sym("run"), v)
+        elif tests.passed is None:
+            v.append("—", style="dim")
+            tbl.add_row(_sym(""), v)
+        elif tests.passed:
+            if tests.count:
+                v.append(tests.count, style="")
+                v.append("  ", style="")
+            if tests.last_run:
+                v.append(time_ago(tests.last_run), style="dim")
+                v.append(f"  {tests.duration:.1f}s", style="dim")
+            tbl.add_row(_sym("good"), v)
+        else:
+            if tests.count:
+                v.append(tests.count, style="red")
+                v.append("  ", style="")
+            if tests.last_run:
+                v.append(time_ago(tests.last_run), style="dim")
+            tbl.add_row(_sym("bad"), v)
+
+    # ─ gh/pr ─────────────────────────────────────────────────────────────────
+    v = Text()
+    if prs.fetching and prs.last_fetch is None:
+        v.append(_elapsed(prs.fetch_started), style="dim")
+        pr_sym = _sym("run")
+    elif not prs.prs:
+        v.append("none", style="dim")
+        if prs.last_fetch:
+            v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
+        pr_sym = _sym("good")
+    else:
+        n = len(prs.prs)
+        v.append(f"{n} open", style="magenta")
+        if prs.last_fetch:
+            v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
+        for pr in prs.prs[:5]:
+            author = (pr.get("author") or {}).get("login", "")
+            v.append(f"\n   #{pr['number']} {pr['title'][:60]}", style="")
+            if author:
+                v.append(f"  {author}", style="dim")
+        pr_sym = _sym("")
+    tbl.add_row(pr_sym, v)
+
+    # ─ body: test output or git status ───────────────────────────────────────
+    parts: list = [header, Text(""), tbl]
+    if tests.cmd and not tests.running and tests.passed is False and tests.output:
+        parts.append(Rule(style="dim red"))
+        parts.append(Text(tests.output, style="dim"))
+    elif git.dirty and git.status_output:
+        parts.append(Rule(style="dim yellow"))
+        parts.append(Text(git.status_output.rstrip(), style="dim"))
+
+    color = "red" if tests.passed is False else ("yellow" if git.dirty else "green")
+
+    return Panel(
+        Group(*parts),
+        title=f"[bold {color}]{target.name}[/]",
+        border_style=color,
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="supervise",
+        description="Continuous project status dashboard",
+    )
+    ap.add_argument("target", nargs="?", default=".", help="project directory (default: cwd)")
+    ap.add_argument("--test-interval", type=int, default=60, metavar="N", help="seconds between test runs (default: 60)")
+    ap.add_argument("--pr-interval", type=int, default=300, metavar="N", help="seconds between PR fetches (default: 300)")
+    ap.add_argument("--refresh", type=float, default=1.0, metavar="S", help="display refresh rate in seconds (default: 1)")
+    args = ap.parse_args()
+
+    target = Path(args.target).expanduser().resolve()
+    if not target.is_dir():
+        print(f"error: {target} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    sup = Supervisor(target, test_interval=args.test_interval, pr_interval=args.pr_interval)
+    sup.start()
+
+    console = Console()
+    try:
+        with Live(render(sup), console=console, refresh_per_second=1) as live:
+            while True:
+                live.update(render(sup))
+                time.sleep(args.refresh)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sup.stop()
+
+
+if __name__ == "__main__":
+    main()
