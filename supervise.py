@@ -374,9 +374,11 @@ def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
         if git.behind:
             v.append(f" ↓{git.behind}", style="red")
         if git.commit_time:
-            v.append(f"  {time_ago(git.commit_time)}", style="dim")
+            v.append("  ", style="")
+            v.append(time_ago(git.commit_time), style="dim")
         if git.commit_msg:
-            v.append(f"  {git.commit_msg}", style="dim italic")
+            v.append("  ", style="")
+            v.append(git.commit_msg, style="dim italic")
         tbl.add_row(_sym("bad" if git.dirty else "good"), v)
 
     # ─ tests ─────────────────────────────────────────────────────────────────
@@ -502,6 +504,7 @@ def main():
         sup.stop()
 
     if reload_needed:
+        console.print("[dim]↺ reloading…[/]")
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
