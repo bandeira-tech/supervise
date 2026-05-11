@@ -105,10 +105,16 @@ class PRState:
     error: Optional[str] = None
 
 
+_WATCH_SKIP = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    "target", "_build", "dist", "build",
+    ".mypy_cache", ".ruff_cache", ".pytest_cache",
+})
+
+
 class Supervisor:
-    def __init__(self, target: Path, test_interval: int, pr_interval: int):
+    def __init__(self, target: Path, pr_interval: int):
         self.target = target.resolve()
-        self.test_interval = test_interval
         self.pr_interval = pr_interval
         self._lock = threading.Lock()
         self.git = GitState()
@@ -167,13 +173,32 @@ class Supervisor:
                 self.git = g
             self._stop.wait(2)
 
+    def _scan_mtimes(self) -> dict:
+        mtimes: dict = {}
+        try:
+            for root, dirs, files in os.walk(self.target):
+                dirs[:] = [d for d in dirs if d not in _WATCH_SKIP]
+                for f in files:
+                    p = Path(root) / f
+                    try:
+                        mtimes[str(p)] = p.stat().st_mtime
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return mtimes
+
     def _test_loop(self):
+        if not self.tests.cmd:
+            return
+        prev = self._scan_mtimes()
+        self._run_tests()
         while not self._stop.is_set():
-            if not self.tests.cmd:
-                self._stop.wait(60)
-                continue
-            self._run_tests()
-            self._stop.wait(self.test_interval)
+            self._stop.wait(1)
+            curr = self._scan_mtimes()
+            if curr != prev:
+                prev = curr
+                self._run_tests()
 
     def _run_tests(self):
         with self._lock:
@@ -439,7 +464,6 @@ def main():
         description="Continuous project status dashboard",
     )
     ap.add_argument("target", nargs="?", default=".", help="project directory (default: cwd)")
-    ap.add_argument("--test-interval", type=int, default=60, metavar="N", help="seconds between test runs (default: 60)")
     ap.add_argument("--pr-interval", type=int, default=300, metavar="N", help="seconds between PR fetches (default: 300)")
     ap.add_argument("--refresh", type=float, default=1.0, metavar="S", help="display refresh rate in seconds (default: 1)")
     args = ap.parse_args()
@@ -449,7 +473,7 @@ def main():
         print(f"error: {target} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    sup = Supervisor(target, test_interval=args.test_interval, pr_interval=args.pr_interval)
+    sup = Supervisor(target, pr_interval=args.pr_interval)
     sup.start()
 
     console = Console()
