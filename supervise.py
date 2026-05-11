@@ -458,6 +458,22 @@ def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
     )
 
 
+def _self_watch_loop(reload: threading.Event) -> None:
+    src = Path(__file__).with_suffix(".py").resolve()
+    try:
+        mtime = src.stat().st_mtime
+    except OSError:
+        return
+    while True:
+        time.sleep(1)
+        try:
+            if src.stat().st_mtime != mtime:
+                reload.set()
+                return
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="supervise",
@@ -473,19 +489,25 @@ def main():
         print(f"error: {target} is not a directory", file=sys.stderr)
         sys.exit(1)
 
+    reload_flag = threading.Event()
+    threading.Thread(target=_self_watch_loop, args=(reload_flag,), daemon=True).start()
+
     sup = Supervisor(target, pr_interval=args.pr_interval)
     sup.start()
 
     console = Console()
     try:
         with Live(render(sup, console), console=console, refresh_per_second=1) as live:
-            while True:
+            while not reload_flag.is_set():
                 live.update(render(sup, console))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
-        pass
+        reload_flag.clear()
     finally:
         sup.stop()
+
+    if reload_flag.is_set():
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":
