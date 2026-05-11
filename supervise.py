@@ -148,7 +148,7 @@ class Supervisor:
                 )
                 if log.strip():
                     parts = log.strip().split("\x1f")
-                    g.commit_msg = parts[0]
+                    g.commit_msg = parts[0].strip()
                     if len(parts) > 1:
                         try:
                             g.commit_time = datetime.fromtimestamp(int(parts[1]), tz=timezone.utc)
@@ -458,22 +458,6 @@ def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
     )
 
 
-def _self_watch_loop(reload: threading.Event) -> None:
-    src = Path(__file__).with_suffix(".py").resolve()
-    try:
-        mtime = src.stat().st_mtime
-    except OSError:
-        return
-    while True:
-        time.sleep(1)
-        try:
-            if src.stat().st_mtime != mtime:
-                reload.set()
-                return
-        except OSError:
-            pass
-
-
 def main():
     ap = argparse.ArgumentParser(
         prog="supervise",
@@ -489,24 +473,35 @@ def main():
         print(f"error: {target} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    reload_flag = threading.Event()
-    threading.Thread(target=_self_watch_loop, args=(reload_flag,), daemon=True).start()
+    script = Path(__file__).with_suffix(".py").resolve()
+    try:
+        script_mtime = script.stat().st_mtime
+    except OSError:
+        script_mtime = None
 
     sup = Supervisor(target, pr_interval=args.pr_interval)
     sup.start()
 
     console = Console()
+    reload_needed = False
     try:
         with Live(render(sup, console), console=console, refresh_per_second=1) as live:
-            while not reload_flag.is_set():
+            while True:
+                if script_mtime is not None:
+                    try:
+                        if script.stat().st_mtime != script_mtime:
+                            reload_needed = True
+                            break
+                    except OSError:
+                        pass
                 live.update(render(sup, console))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
-        reload_flag.clear()
+        pass
     finally:
         sup.stop()
 
-    if reload_flag.is_set():
+    if reload_needed:
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
