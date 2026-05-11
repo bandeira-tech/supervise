@@ -79,6 +79,8 @@ class GitState:
     commit_msg: str = ""
     commit_time: Optional[datetime] = None
     remote_url: Optional[str] = None
+    ahead: int = 0
+    behind: int = 0
     error: Optional[str] = None
 
 
@@ -144,6 +146,17 @@ class Supervisor:
                     if len(parts) > 1:
                         try:
                             g.commit_time = datetime.fromtimestamp(int(parts[1]), tz=timezone.utc)
+                        except ValueError:
+                            pass
+                _, ab_out, _ = run(
+                    ["git", "rev-list", "--count", "--left-right", "HEAD...@{u}"],
+                    cwd=self.target,
+                )
+                if ab_out.strip():
+                    ab_parts = ab_out.strip().split()
+                    if len(ab_parts) == 2:
+                        try:
+                            g.ahead, g.behind = int(ab_parts[0]), int(ab_parts[1])
                         except ValueError:
                             pass
                 if self._remote_url is None:
@@ -331,6 +344,10 @@ def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
         tbl.add_row(_sym("bad"), Text(git.error, style="red"))
     else:
         v = Text(git.branch, style="yellow")
+        if git.ahead:
+            v.append(f" ↑{git.ahead}", style="green")
+        if git.behind:
+            v.append(f" ↓{git.behind}", style="red")
         if git.commit_time:
             v.append(f"  {time_ago(git.commit_time)}", style="dim")
         if git.commit_msg:
