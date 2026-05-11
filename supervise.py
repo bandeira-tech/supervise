@@ -2,6 +2,7 @@
 """supervise — continuous project status dashboard"""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -351,7 +352,16 @@ def _sym(state: str) -> Text:
     }.get(state, Text(" "))
 
 
-def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
+def _script_version(script: Path) -> str:
+    try:
+        h = hashlib.sha1(script.read_bytes()).hexdigest()[:7]
+        ts = datetime.fromtimestamp(script.stat().st_mtime).strftime("%Y%m%dT%H%M")
+        return f">>@v0.1.{h}-{ts}"
+    except Exception:
+        return ""
+
+
+def render(sup: Supervisor, console: Optional[Console] = None, version: str = "") -> Panel:
     git, tests, prs = sup.snapshot()
     target = sup.target
 
@@ -465,6 +475,8 @@ def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
     return Panel(
         Group(*parts),
         title=f"[bold {color}]{target.name}[/]",
+        subtitle=f"[dim]{version}[/]" if version else None,
+        subtitle_align="right",
         border_style=color,
         box=box.ROUNDED,
         padding=(0, 1),
@@ -491,6 +503,7 @@ def main():
         script_mtime = script.stat().st_mtime
     except OSError:
         script_mtime = None
+    version = _script_version(script)
 
     sup = Supervisor(target, pr_interval=args.pr_interval)
     sup.start()
@@ -498,7 +511,7 @@ def main():
     console = Console()
     reload_needed = False
     try:
-        with Live(render(sup, console), console=console, refresh_per_second=1) as live:
+        with Live(render(sup, console, version), console=console, refresh_per_second=1) as live:
             while True:
                 if script_mtime is not None:
                     try:
@@ -507,7 +520,7 @@ def main():
                             break
                     except OSError:
                         pass
-                live.update(render(sup, console))
+                live.update(render(sup, console, version))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
         pass
