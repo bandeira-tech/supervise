@@ -258,6 +258,19 @@ def _parse_test_counts(output: str) -> Optional[str]:
     return None
 
 
+def _clip_output(output: str, console: Optional["Console"] = None) -> str:
+    try:
+        height = console.size.height if console else os.get_terminal_size().lines
+    except Exception:
+        height = 40
+    max_lines = max(5, height - 14)
+    lines = output.splitlines()
+    if len(lines) <= max_lines:
+        return output
+    clipped = len(lines) - max_lines
+    return f"[↑ {clipped} more lines]\n" + "\n".join(lines[-max_lines:])
+
+
 def _elapsed(since: Optional[datetime]) -> str:
     if since is None:
         return ""
@@ -289,7 +302,7 @@ def _sym(state: str) -> Text:
     }.get(state, Text(" "))
 
 
-def render(sup: Supervisor) -> Panel:
+def render(sup: Supervisor, console: Optional[Console] = None) -> Panel:
     git, tests, prs = sup.snapshot()
     target = sup.target
 
@@ -385,7 +398,7 @@ def render(sup: Supervisor) -> Panel:
     parts: list = [header, Text(""), tbl]
     if test_failed and tests.output:
         parts.append(Rule(style="dim red"))
-        parts.append(Text(tests.output, style="dim"))
+        parts.append(Text(_clip_output(tests.output, console), style="dim"))
         parts.append(Rule(style="dim red"))
     parts.append(pr_tbl)
     if not test_failed and git.dirty and git.status_output:
@@ -424,9 +437,9 @@ def main():
 
     console = Console()
     try:
-        with Live(render(sup), console=console, refresh_per_second=1) as live:
+        with Live(render(sup, console), console=console, refresh_per_second=1) as live:
             while True:
-                live.update(render(sup))
+                live.update(render(sup, console))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
         pass
