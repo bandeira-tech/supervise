@@ -504,7 +504,7 @@ def main():
         sup.stop()
 
     if reload_needed:
-        console.print("[dim]↺ reloading…[/]")
+        console.clear()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
