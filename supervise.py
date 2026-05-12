@@ -473,7 +473,8 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
     header = Text(display, style="cyan")
     if git.remote_url:
         repo_label = git.remote_url.removeprefix("https://")
-        header.append(f"  {repo_label}", style=Style(color="bright_black", link=git.remote_url))
+        header.append("  ")
+        header.append(repo_label, style=Style(color="bright_black", link=git.remote_url))
 
     tbl = Table(
         show_header=False, box=None,
