@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +108,18 @@ class PRState:
     error: Optional[str] = None
 
 
+@dataclass
+class PackageState:
+    name: Optional[str] = None
+    registry: str = "npm"               # "npm" or "jsr"
+    local_version: Optional[str] = None # from config file
+    published_version: Optional[str] = None
+    fetching: bool = False
+    fetch_started: Optional[datetime] = None
+    last_fetch: Optional[datetime] = None
+    error: Optional[str] = None
+
+
 _WATCH_SKIP_DIRS = frozenset({
     ".git", "__pycache__", "node_modules", ".venv", "venv",
     "target", "_build", "dist", "build",
@@ -129,11 +143,16 @@ class Supervisor:
         self.git = GitState()
         self.tests = TestState(cmd=detect_test_cmd(target))
         self.prs = PRState()
+        self.pkg = PackageState()
         self._stop = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
+        self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
+        if self._pkg_info:
+            registry, name, local_version = self._pkg_info
+            self.pkg = PackageState(name=name, registry=registry, local_version=local_version)
 
     def start(self):
-        for fn in (self._git_loop, self._test_loop, self._pr_loop):
+        for fn in (self._git_loop, self._test_loop, self._pr_loop, self._pkg_loop):
             t = threading.Thread(target=fn, daemon=True)
             t.start()
 
@@ -268,9 +287,35 @@ class Supervisor:
         with self._lock:
             self.prs = p
 
+    def _pkg_loop(self):
+        if not self._pkg_info:
+            return
+        self._fetch_pkg()
+        while not self._stop.is_set():
+            self._stop.wait(600)
+            if not self._stop.is_set():
+                self._fetch_pkg()
+
+    def _fetch_pkg(self):
+        with self._lock:
+            if not self.pkg.name:
+                return
+            self.pkg.fetching = True
+            self.pkg.fetch_started = datetime.now(tz=timezone.utc)
+            registry = self.pkg.registry
+            name = self.pkg.name
+
+        published = _fetch_published_version(registry, name)
+
+        with self._lock:
+            self.pkg.fetching = False
+            self.pkg.fetch_started = None
+            self.pkg.published_version = published
+            self.pkg.last_fetch = datetime.now(tz=timezone.utc)
+
     def snapshot(self):
         with self._lock:
-            return self.git, self.tests, self.prs
+            return self.git, self.tests, self.prs, self.pkg
 
 
 def _parse_github_url(remote: str) -> Optional[str]:
@@ -281,6 +326,60 @@ def _parse_github_url(remote: str) -> Optional[str]:
     if m:
         return f"https://github.com/{m.group(1)}"
     return None
+
+
+def _detect_package(target: Path) -> Optional[tuple[str, str, Optional[str]]]:
+    """Return (registry, name, local_version) from project config, or None."""
+    for fname in ("deno.json", "deno.jsonc"):
+        fp = target / fname
+        if fp.exists():
+            try:
+                cfg = json.loads(fp.read_text())
+                name = cfg.get("name", "")
+                version = cfg.get("version") or None
+                if name.startswith("@"):
+                    return ("jsr", name, version)
+            except Exception:
+                pass
+    fp = target / "package.json"
+    if fp.exists():
+        try:
+            pkg = json.loads(fp.read_text())
+            name = pkg.get("name", "")
+            version = pkg.get("version") or None
+            if name:
+                return ("npm", name, version)
+        except Exception:
+            pass
+    return None
+
+
+def _fetch_published_version(registry: str, name: str) -> Optional[str]:
+    try:
+        if registry == "npm":
+            url = f"https://registry.npmjs.org/{name}/latest"
+        else:
+            url = f"https://jsr.io/{name}/meta.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "supervise/0.1"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("version") if registry == "npm" else data.get("latest")
+    except Exception:
+        return None
+
+
+def _version_gt(a: str, b: str) -> bool:
+    def parts(v: str) -> list[int]:
+        v = re.sub(r"^v", "", v)
+        v = re.split(r"[-+]", v)[0]
+        result = []
+        for p in v.split("."):
+            try:
+                result.append(int(p))
+            except ValueError:
+                result.append(0)
+        return result
+    return parts(a) > parts(b)
 
 
 def _parse_test_counts(output: str) -> Optional[str]:
@@ -362,7 +461,7 @@ def _script_version(script: Path) -> str:
 
 
 def render(sup: Supervisor, console: Optional[Console] = None, version: str = "") -> Panel:
-    git, tests, prs = sup.snapshot()
+    git, tests, prs, pkg = sup.snapshot()
     target = sup.target
 
     home = Path.home()
@@ -458,9 +557,35 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         pr_sym = _sym("")
     pr_tbl.add_row(pr_sym, v)
 
+    # ─ package version line (sits between header and status rows) ────────────
+    if pkg.name:
+        label = f"{pkg.registry}:{pkg.name}"
+        pkg_line = Text()
+        if pkg.fetching and pkg.last_fetch is None:
+            pkg_line.append("~", style="yellow")
+            pkg_line.append(f"  {label}", style="")
+            pkg_line.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
+        elif pkg.published_version is None:
+            pkg_line.append(" ")
+            pkg_line.append(f"  {label}", style="dim")
+        else:
+            local = pkg.local_version
+            published = pkg.published_version
+            match = (local == published) if local else True
+            pkg_line.append("✓" if match else "✗", style="bold green" if match else "bold red")
+            pkg_line.append(f"  {label}", style="")
+            if local and local != published and _version_gt(local, published):
+                pkg_line.append(f"  ↑{local}", style="green")
+            pkg_line.append(f"  {published}", style="dim")
+            if pkg.last_fetch:
+                pkg_line.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
+        spacer = pkg_line
+    else:
+        spacer = Text("")
+
     # ─ assemble: test failures appear above PR list ───────────────────────────
     test_failed = tests.cmd and not tests.running and tests.passed is False
-    parts: list = [header, Text(""), tbl]
+    parts: list = [header, spacer, tbl]
     if test_failed and tests.output:
         parts.append(Rule(style="dim red"))
         parts.append(Text(_clip_output(tests.output, console), style="dim"))
