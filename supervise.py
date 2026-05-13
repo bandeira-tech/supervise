@@ -600,14 +600,16 @@ def _content_body(target: Path) -> tuple[list, str]:
     if src.is_dir():
         # top: contents of src/
         code_dirs, code_files, _ = _scan_dir(src)
-        # bottom: root items excluding src itself
+        # bottom: full root listing, src included
         root_dirs, root_code, root_rest = _scan_dir(target)
-        bottom_dirs  = [d for d in root_dirs if d != "src"]
+        bottom_dirs  = root_dirs   # src stays in here
         bottom_files = root_code + root_rest
+        open_dir     = "src"
     else:
         code_dirs, code_files, rest = _scan_dir(target)
         bottom_dirs  = []
         bottom_files = rest
+        open_dir     = None
 
     parts: list = []
 
@@ -634,7 +636,10 @@ def _content_body(target: Path) -> tuple[list, str]:
         )
         rest_tbl.add_column("name", no_wrap=True, overflow="ellipsis")
         for d in bottom_dirs:
-            rest_tbl.add_row(Text(f"{d}/", style="dim cyan"))
+            if d == open_dir:
+                rest_tbl.add_row(Text(f"▸ {d}/", style="cyan"))
+            else:
+                rest_tbl.add_row(Text(f"  {d}/", style="dim cyan"))
         for f in bottom_files:
             rest_tbl.add_row(Text(f, style="dim"))
         parts.append(rest_tbl)
