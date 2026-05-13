@@ -574,26 +574,40 @@ def _ops_body(
     return parts, color
 
 
-def _content_body(target: Path) -> tuple[list, str]:
+def _scan_dir(path: Path) -> tuple[list[str], list[str], list[str]]:
+    """Return (code_dirs, code_files, rest_files) for one directory level."""
     try:
-        raw = sorted(os.listdir(target))
+        entries = sorted(os.listdir(path))
     except Exception:
-        return [Text("cannot read directory", style="red")], "red"
-
-    code_dirs: list[str] = []
-    code_files: list[str] = []
-    rest: list[str] = []
-
-    for name in raw:
-        p = target / name
+        return [], [], []
+    dirs, code_files, rest_files = [], [], []
+    for name in entries:
+        p = path / name
         if p.is_dir():
             if not name.startswith(".") and name not in _WATCH_SKIP_DIRS:
-                code_dirs.append(name)
+                dirs.append(name)
         elif p.is_file():
             if Path(name).suffix.lower() in _CODE_EXTS:
                 code_files.append(name)
             else:
-                rest.append(name)
+                rest_files.append(name)
+    return dirs, code_files, rest_files
+
+
+def _content_body(target: Path) -> tuple[list, str]:
+    src = target / "src"
+
+    if src.is_dir():
+        # top: contents of src/
+        code_dirs, code_files, _ = _scan_dir(src)
+        # bottom: root items excluding src itself
+        root_dirs, root_code, root_rest = _scan_dir(target)
+        bottom_dirs  = [d for d in root_dirs if d != "src"]
+        bottom_files = root_code + root_rest
+    else:
+        code_dirs, code_files, rest = _scan_dir(target)
+        bottom_dirs  = []
+        bottom_files = rest
 
     parts: list = []
 
@@ -610,7 +624,7 @@ def _content_body(target: Path) -> tuple[list, str]:
             code_tbl.add_row(Text(f))
         parts.append(code_tbl)
 
-    if rest:
+    if bottom_dirs or bottom_files:
         if parts:
             parts.append(Rule(style="dim"))
         rest_tbl = Table(
@@ -619,7 +633,9 @@ def _content_body(target: Path) -> tuple[list, str]:
             padding=(0, 0, 0, 1),
         )
         rest_tbl.add_column("name", no_wrap=True, overflow="ellipsis")
-        for f in rest:
+        for d in bottom_dirs:
+            rest_tbl.add_row(Text(f"{d}/", style="dim cyan"))
+        for f in bottom_files:
             rest_tbl.add_row(Text(f, style="dim"))
         parts.append(rest_tbl)
 
