@@ -134,6 +134,17 @@ _WATCH_SKIP_FILES = frozenset({
     "poetry.lock", "Gemfile.lock", "go.sum", "composer.lock",
 })
 
+_CODE_EXTS = frozenset({
+    ".py", ".pyi", ".ts", ".tsx", ".mts", ".cts",
+    ".js", ".jsx", ".mjs", ".cjs",
+    ".ex", ".exs", ".go", ".rs", ".java", ".kt", ".scala",
+    ".c", ".cpp", ".cc", ".h", ".hpp",
+    ".swift", ".rb", ".php", ".cs",
+    ".lua", ".zig", ".elm", ".clj", ".cljs",
+    ".ml", ".mli", ".hs", ".jl",
+    ".sh", ".bash", ".zsh", ".fish",
+})
+
 
 class Supervisor:
     def __init__(self, target: Path, pr_interval: int):
@@ -460,22 +471,9 @@ def _script_version(script: Path) -> str:
         return ""
 
 
-def render(sup: Supervisor, console: Optional[Console] = None, version: str = "") -> Panel:
-    git, tests, prs, pkg = sup.snapshot()
-    target = sup.target
-
-    home = Path.home()
-    try:
-        display = "~/" + str(target.relative_to(home))
-    except ValueError:
-        display = str(target)
-
-    header = Text(display, style="cyan")
-    if git.remote_url:
-        repo_label = git.remote_url.removeprefix("https://")
-        header.append("  ")
-        header.append(repo_label, style=Style(color="bright_black", link=git.remote_url))
-
+def _ops_body(
+    git: GitState, tests: TestState, prs: PRState, console: Optional[Console]
+) -> tuple[list, str]:
     tbl = Table(
         show_header=False, box=None,
         pad_edge=False, show_edge=False,
@@ -558,35 +556,8 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         pr_sym = _sym("")
     pr_tbl.add_row(pr_sym, v)
 
-    # ─ package version line (sits between header and status rows) ────────────
-    if pkg.name:
-        label = f"{pkg.registry}:{pkg.name}"
-        pkg_line = Text()
-        if pkg.fetching and pkg.last_fetch is None:
-            pkg_line.append("~", style="yellow")
-            pkg_line.append(f"  {label}", style="")
-            pkg_line.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
-        elif pkg.published_version is None:
-            pkg_line.append(" ")
-            pkg_line.append(f"  {label}", style="dim")
-        else:
-            local = pkg.local_version
-            published = pkg.published_version
-            match = (local == published) if local else True
-            pkg_line.append("✓" if match else "✗", style="bold green" if match else "bold red")
-            pkg_line.append(f"  {label}", style="")
-            if local and local != published and _version_gt(local, published):
-                pkg_line.append(f"  ↑{local}", style="green")
-            pkg_line.append(f"  {published}", style="dim")
-            if pkg.last_fetch:
-                pkg_line.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
-        spacer = pkg_line
-    else:
-        spacer = Text("")
-
-    # ─ assemble: test failures appear above PR list ───────────────────────────
     test_failed = tests.cmd and not tests.running and tests.passed is False
-    parts: list = [header, spacer, tbl]
+    parts: list = [tbl]
     if test_failed and tests.output:
         parts.append(Rule(style="dim red"))
         parts.append(Text(_clip_output(tests.output, console), style="dim"))
@@ -597,9 +568,112 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         parts.append(Text(git.status_output.rstrip(), style="dim"))
 
     color = "red" if tests.passed is False else ("yellow" if git.dirty else "green")
+    return parts, color
+
+
+def _content_body(target: Path) -> tuple[list, str]:
+    try:
+        raw = sorted(os.listdir(target))
+    except Exception:
+        return [Text("cannot read directory", style="red")], "red"
+
+    code_dirs: list[str] = []
+    code_files: list[str] = []
+    rest: list[str] = []
+
+    for name in raw:
+        p = target / name
+        if p.is_dir():
+            if not name.startswith(".") and name not in _WATCH_SKIP_DIRS:
+                code_dirs.append(name)
+        elif p.is_file():
+            if Path(name).suffix.lower() in _CODE_EXTS:
+                code_files.append(name)
+            else:
+                rest.append(name)
+
+    parts: list = []
+
+    if code_dirs or code_files:
+        code_tbl = Table(
+            show_header=False, box=None,
+            pad_edge=False, show_edge=False,
+            padding=(0, 0, 0, 1),
+        )
+        code_tbl.add_column("name", no_wrap=True, overflow="ellipsis")
+        for d in code_dirs:
+            code_tbl.add_row(Text(f"{d}/", style="cyan"))
+        for f in code_files:
+            code_tbl.add_row(Text(f))
+        parts.append(code_tbl)
+
+    if rest:
+        if parts:
+            parts.append(Rule(style="dim"))
+        rest_tbl = Table(
+            show_header=False, box=None,
+            pad_edge=False, show_edge=False,
+            padding=(0, 0, 0, 1),
+        )
+        rest_tbl.add_column("name", no_wrap=True, overflow="ellipsis")
+        for f in rest:
+            rest_tbl.add_row(Text(f, style="dim"))
+        parts.append(rest_tbl)
+
+    return parts, "blue"
+
+
+def _pkg_line(pkg: PackageState) -> Text:
+    if not pkg.name:
+        return Text("")
+    label = f"{pkg.registry}:{pkg.name}"
+    t = Text()
+    if pkg.fetching and pkg.last_fetch is None:
+        t.append("~", style="yellow")
+        t.append(f"  {label}")
+        t.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
+    elif pkg.published_version is None:
+        t.append(" ")
+        t.append(f"  {label}", style="dim")
+    else:
+        local = pkg.local_version
+        published = pkg.published_version
+        match = (local == published) if local else True
+        t.append("✓" if match else "✗", style="bold green" if match else "bold red")
+        t.append(f"  {label}")
+        if local and local != published and _version_gt(local, published):
+            t.append(f"  ↑{local}", style="green")
+        t.append(f"  {published}", style="dim")
+        if pkg.last_fetch:
+            t.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
+    return t
+
+
+def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops") -> Panel:
+    git, tests, prs, pkg = sup.snapshot()
+    target = sup.target
+
+    home = Path.home()
+    try:
+        display = "~/" + str(target.relative_to(home))
+    except ValueError:
+        display = str(target)
+
+    header = Text(display, style="cyan")
+    if git.remote_url:
+        repo_label = git.remote_url.removeprefix("https://")
+        header.append("  ")
+        header.append(repo_label, style=Style(color="bright_black", link=git.remote_url))
+
+    spacer = _pkg_line(pkg)
+
+    if view == "content":
+        body_parts, color = _content_body(target)
+    else:
+        body_parts, color = _ops_body(git, tests, prs, console)
 
     return Panel(
-        Group(*parts),
+        Group(header, spacer, *body_parts),
         title=f"[bold {color}]{target.name}[/]",
         subtitle=f"[dim]{version}[/]" if version else None,
         subtitle_align="right",
@@ -615,6 +689,7 @@ def main():
         description="Continuous project status dashboard",
     )
     ap.add_argument("target", nargs="?", default=".", help="project directory (default: cwd)")
+    ap.add_argument("-v", "--view", choices=["ops", "content"], default="ops", metavar="VIEW", help="view mode: ops (default) or content")
     ap.add_argument("--pr-interval", type=int, default=300, metavar="N", help="seconds between PR fetches (default: 300)")
     ap.add_argument("--refresh", type=float, default=1.0, metavar="S", help="display refresh rate in seconds (default: 1)")
     args = ap.parse_args()
@@ -637,7 +712,7 @@ def main():
     console = Console()
     reload_needed = False
     try:
-        with Live(render(sup, console, version), console=console, refresh_per_second=1) as live:
+        with Live(render(sup, console, version, view=args.view), console=console, refresh_per_second=1) as live:
             while True:
                 if script_mtime is not None:
                     try:
@@ -646,7 +721,7 @@ def main():
                             break
                     except OSError:
                         pass
-                live.update(render(sup, console, version))
+                live.update(render(sup, console, version, view=args.view))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
         pass
