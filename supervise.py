@@ -732,7 +732,7 @@ def main():
     fd = sys.stdin.fileno() if raw_mode else -1
     old_term = termios.tcgetattr(fd) if raw_mode else None
     if raw_mode:
-        tty.setraw(fd)
+        tty.setcbreak(fd)
 
     def _read_key() -> Optional[str]:
         if raw_mode and select.select([sys.stdin], [], [], 0)[0]:
