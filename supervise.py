@@ -669,11 +669,13 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
 
     if view == "content":
         body_parts, color = _content_body(target)
+        top_parts: list = []
     else:
         body_parts, color = _ops_body(git, tests, prs, console)
+        top_parts = [header, spacer]
 
     return Panel(
-        Group(header, spacer, *body_parts),
+        Group(*top_parts, *body_parts),
         title=f"[bold {color}]{target.name}[/]",
         subtitle=f"[dim]{version}[/]" if version else None,
         subtitle_align="right",
