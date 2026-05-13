@@ -650,7 +650,7 @@ def _pkg_line(pkg: PackageState) -> Text:
     return t
 
 
-def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False) -> Panel:
+def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False) -> Group:
     git, tests, prs, pkg = sup.snapshot()
     target = sup.target
 
