@@ -511,12 +511,14 @@ def _ops_body(
             v.append(f" ↑{git.ahead}", style="green")
         if git.behind:
             v.append(f" ↓{git.behind}", style="red")
-        if git.commit_time:
-            v.append("  ", style="")
-            v.append(time_ago(git.commit_time), style="dim")
-        if git.commit_msg:
-            v.append("  ", style="")
-            v.append(git.commit_msg, style="dim italic")
+        if prs.prs:
+            v.append(f"  {len(prs.prs)} PR", style="magenta")
+        if git.commit_time or git.commit_msg:
+            v.append("\n  ")
+            if git.commit_time:
+                v.append(time_ago(git.commit_time), style="dim")
+            if git.commit_msg:
+                v.append(f"  {git.commit_msg}", style="dim italic")
         tbl.add_row(_sym("bad" if git.dirty else "good"), v)
 
     # ─ tests ─────────────────────────────────────────────────────────────────
