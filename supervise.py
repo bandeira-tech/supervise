@@ -181,8 +181,8 @@ class Supervisor:
         self._pr_wake.set()
         self._pkg_wake.set()
         with self._lock:
-            tests_broken = self.tests.passed is False and not self.tests.running
-        if tests_broken:
+            can_run = self.tests.cmd is not None and not self.tests.running
+        if can_run:
             self._test_wake.set()
 
     def _git_loop(self):
@@ -524,6 +524,11 @@ def _ops_body(
         v = Text()
         if tests.running:
             v.append(_elapsed(tests.run_started), style="dim")
+            if tests.count:
+                v.append(f"  {tests.count}", style="dim")
+            if tests.last_run:
+                v.append(f"  {time_ago(tests.last_run)}", style="dim")
+                v.append(f"  {tests.duration:.1f}s", style="dim")
             tbl.add_row(_sym("run"), v)
         elif tests.passed is None:
             v.append("—", style="dim")
@@ -558,12 +563,16 @@ def _ops_body(
         v.append(_elapsed(prs.fetch_started), style="dim")
         pr_sym = _sym("run")
     elif not prs.prs:
+        if prs.fetching:
+            v.append(f"{_elapsed(prs.fetch_started)}  ", style="dim")
         v.append("none", style="dim")
         if prs.last_fetch:
             v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
-        pr_sym = _sym("good")
+        pr_sym = _sym("run") if prs.fetching else _sym("good")
     else:
         n = len(prs.prs)
+        if prs.fetching:
+            v.append(f"{_elapsed(prs.fetch_started)}  ", style="dim")
         v.append(f"{n} open", style="magenta")
         if prs.last_fetch:
             v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
@@ -681,12 +690,16 @@ def _pkg_line(pkg: PackageState) -> Text:
         local = pkg.local_version
         published = pkg.published_version
         match = (local == published) if local else True
-        t.append("✓" if match else "✗", style="bold green" if match else "bold red")
+        if pkg.fetching:
+            t.append("~", style="yellow")
+            t.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
+        else:
+            t.append("✓" if match else "✗", style="bold green" if match else "bold red")
         t.append(f"  {label}")
         if local and local != published and _version_gt(local, published):
             t.append(f"  ↑{local}", style="green")
         t.append(f"  {published}", style="dim")
-        if pkg.last_fetch:
+        if pkg.last_fetch and not pkg.fetching:
             t.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
     return t
 
@@ -723,8 +736,10 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         h.append("  ops    ", style="dim")
         h.append("2", style="bold")
         h.append("  content    ", style="dim")
-        h.append("↵", style="bold")
-        h.append("  refresh remote", style="dim")
+        h.append("!", style="bold")
+        h.append("  refresh ops    ", style="dim")
+        h.append("@", style="bold")
+        h.append("  refresh content", style="dim")
         body_parts.append(h)
 
     bar = Table(
@@ -775,11 +790,39 @@ def main():
     old_term = termios.tcgetattr(fd) if raw_mode else None
     if raw_mode:
         tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?1000h\x1b[?1006h")  # enable SGR mouse
+        sys.stdout.flush()
 
-    def _read_key() -> Optional[str]:
-        if raw_mode and select.select([sys.stdin], [], [], 0)[0]:
-            return sys.stdin.read(1)
-        return None
+    def _read_input() -> object:
+        """Return a key str, ('mouse', btn, col, row, pressed) tuple, or None."""
+        if not raw_mode or not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        ch = sys.stdin.read(1)
+        if ch != "\x1b":
+            return ch
+        buf = ""
+        while select.select([sys.stdin], [], [], 0.02)[0]:
+            c = sys.stdin.read(1)
+            buf += c
+            if buf and buf[-1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz~":
+                break
+        m = re.match(r"\[<(\d+);(\d+);(\d+)([Mm])$", buf)
+        if m:
+            return ("mouse", int(m[1]), int(m[2]), int(m[3]), m[4] == "M")
+        return None  # unrecognised escape sequence
+
+    def _click_map() -> dict[int, str]:
+        """Map screen row (1-indexed) → action for left-column clicks in ops view."""
+        if view != "ops":
+            return {}
+        # row 1: title bar, row 2: header, row 3: spacer, row 4: git
+        has_tests = sup.tests.cmd is not None
+        pr_row = 6 if has_tests else 5
+        result = {}
+        if has_tests:
+            result[5] = "tests"
+        result[pr_row] = "prs"
+        return result
 
     try:
         with Live(render(sup, console, version, view=view, show_help=show_help), console=console, refresh_per_second=1) as live:
@@ -791,25 +834,42 @@ def main():
                             break
                     except OSError:
                         pass
-                ch = _read_key()
-                if ch in ("\x03", "\x04"):   # Ctrl-C / Ctrl-D
-                    break
-                elif ch == "1":
-                    view, show_help = "ops", False
-                elif ch == "2":
-                    view, show_help = "content", False
-                elif ch == "?":
-                    show_help = not show_help
-                elif ch in ("\r", "\n"):
-                    sup.force_refresh()
-                live.update(render(sup, console, version, view=view, show_help=show_help))
-                if ch is None:
+                event = _read_input()
+                if event is None:
                     time.sleep(args.refresh)
+                elif isinstance(event, tuple) and event[0] == "mouse":
+                    _, btn, col, row, pressed = event
+                    if btn == 0 and pressed and col <= 4:
+                        action = _click_map().get(row)
+                        if action == "tests":
+                            sup._test_wake.set()
+                        elif action == "prs":
+                            sup._pr_wake.set()
+                elif isinstance(event, str):
+                    ch = event
+                    if ch in ("\x03", "\x04"):
+                        break
+                    elif ch == "1":
+                        view, show_help = "ops", False
+                    elif ch == "2":
+                        view, show_help = "content", False
+                    elif ch == "!":   # Shift+1 — switch to ops + full refresh
+                        view, show_help = "ops", False
+                        sup.force_refresh()
+                    elif ch == "@":   # Shift+2 — switch to content + full refresh
+                        view, show_help = "content", False
+                        sup.force_refresh()
+                    elif ch == "?":
+                        show_help = not show_help
+                live.update(render(sup, console, version, view=view, show_help=show_help))
     except KeyboardInterrupt:
         pass
     finally:
-        if raw_mode and old_term is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+        if raw_mode:
+            sys.stdout.write("\x1b[?1000l\x1b[?1006l")  # disable mouse
+            sys.stdout.flush()
+            if old_term is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         sup.stop()
 
     if reload_needed:
