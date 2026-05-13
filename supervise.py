@@ -512,7 +512,9 @@ def _ops_body(
         if git.behind:
             v.append(f" ↓{git.behind}", style="red")
         if prs.prs:
-            v.append(f"  {len(prs.prs)} PR", style="magenta")
+            pulls_url = f"{git.remote_url}/pulls" if git.remote_url else None
+            v.append("  ")
+            v.append(f"{len(prs.prs)} PR", style=Style(color="magenta", link=pulls_url) if pulls_url else Style(color="magenta"))
         if git.commit_time or git.commit_msg:
             v.append("\n  ")
             if git.commit_time:
@@ -572,16 +574,13 @@ def _ops_body(
             v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
         pr_sym = _sym("run") if prs.fetching else _sym("good")
     else:
-        n = len(prs.prs)
         if prs.fetching:
-            v.append(f"{_elapsed(prs.fetch_started)}  ", style="dim")
-        v.append(f"{n} open", style="magenta")
-        if prs.last_fetch:
-            v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
-        for pr in prs.prs[:5]:
+            v.append(f"{_elapsed(prs.fetch_started)}", style="dim")
+        for i, pr in enumerate(prs.prs[:5]):
             author = (pr.get("author") or {}).get("login", "")
             pr_url = f"{git.remote_url}/pull/{pr['number']}" if git.remote_url else None
-            v.append("\n   ")
+            if i > 0 or prs.fetching:
+                v.append("\n   ")
             v.append(f"#{pr['number']} {pr['title'][:60]}", style=Style(link=pr_url) if pr_url else Style())
             if author:
                 v.append(f"  {author}", style="dim")
