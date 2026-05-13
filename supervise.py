@@ -300,7 +300,7 @@ class Supervisor:
             self.prs.fetch_started = datetime.now(tz=timezone.utc)
 
         rc, out, err = run(
-            ["gh", "pr", "list", "--json", "number,title,author,createdAt", "--limit", "10"],
+            ["gh", "pr", "list", "--json", "number,title,author,createdAt,headRefName", "--limit", "10"],
             cwd=self.target,
             timeout=20,
         )
@@ -511,10 +511,6 @@ def _ops_body(
             v.append(f" ↑{git.ahead}", style="green")
         if git.behind:
             v.append(f" ↓{git.behind}", style="red")
-        if prs.prs:
-            pulls_url = f"{git.remote_url}/pulls" if git.remote_url else None
-            v.append("  ")
-            v.append(f"{len(prs.prs)} PR", style=Style(color="magenta", link=pulls_url) if pulls_url else Style(color="magenta"))
         if git.commit_time or git.commit_msg:
             v.append("\n  ")
             if git.commit_time:
@@ -579,8 +575,10 @@ def _ops_body(
         for i, pr in enumerate(prs.prs[:5]):
             author = (pr.get("author") or {}).get("login", "")
             pr_url = f"{git.remote_url}/pull/{pr['number']}" if git.remote_url else None
+            is_current = pr.get("headRefName") == git.branch
             if i > 0 or prs.fetching:
-                v.append("\n   ")
+                v.append("\n")
+            v.append("▸  " if is_current else "   ")
             v.append(f"#{pr['number']} {pr['title'][:60]}", style=Style(link=pr_url) if pr_url else Style())
             if author:
                 v.append(f"  {author}", style="dim")
