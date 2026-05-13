@@ -551,7 +551,8 @@ def _ops_body(
             v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
         for pr in prs.prs[:5]:
             author = (pr.get("author") or {}).get("login", "")
-            v.append(f"\n   #{pr['number']} {pr['title'][:60]}", style="")
+            pr_url = f"{git.remote_url}/pull/{pr['number']}" if git.remote_url else None
+            v.append(f"\n   #{pr['number']} {pr['title'][:60]}", style=Style(link=pr_url) if pr_url else Style())
             if author:
                 v.append(f"  {author}", style="dim")
         pr_sym = _sym("")
