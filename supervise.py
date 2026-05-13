@@ -157,6 +157,8 @@ class Supervisor:
         self.prs = PRState()
         self.pkg = PackageState()
         self._stop = threading.Event()
+        self._pr_wake = threading.Event()
+        self._pkg_wake = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
         self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
         if self._pkg_info:
@@ -170,6 +172,12 @@ class Supervisor:
 
     def stop(self):
         self._stop.set()
+        self._pr_wake.set()
+        self._pkg_wake.set()
+
+    def force_refresh(self):
+        self._pr_wake.set()
+        self._pkg_wake.set()
 
     def _git_loop(self):
         while not self._stop.is_set():
@@ -275,7 +283,8 @@ class Supervisor:
     def _pr_loop(self):
         while not self._stop.is_set():
             self._fetch_prs()
-            self._stop.wait(self.pr_interval)
+            self._pr_wake.wait(timeout=self.pr_interval)
+            self._pr_wake.clear()
 
     def _fetch_prs(self):
         with self._lock:
@@ -304,7 +313,8 @@ class Supervisor:
             return
         self._fetch_pkg()
         while not self._stop.is_set():
-            self._stop.wait(600)
+            self._pkg_wake.wait(timeout=600)
+            self._pkg_wake.clear()
             if not self._stop.is_set():
                 self._fetch_pkg()
 
@@ -704,7 +714,9 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         h.append("1", style="bold")
         h.append("  ops    ", style="dim")
         h.append("2", style="bold")
-        h.append("  content", style="dim")
+        h.append("  content    ", style="dim")
+        h.append("↵", style="bold")
+        h.append("  refresh remote", style="dim")
         body_parts.append(h)
 
     bar = Table(
@@ -780,6 +792,8 @@ def main():
                     view, show_help = "content", False
                 elif ch == "?":
                     show_help = not show_help
+                elif ch == "\r":
+                    sup.force_refresh()
                 live.update(render(sup, console, version, view=view, show_help=show_help))
                 if ch is None:
                     time.sleep(args.refresh)
