@@ -566,7 +566,7 @@ def _ops_body(
             v.append(f"#{pr['number']} {pr['title'][:60]}", style=Style(link=pr_url) if pr_url else Style())
             if author:
                 v.append(f"  {author}", style="dim")
-        pr_sym = _sym("")
+        pr_sym = _sym("run") if prs.fetching else _sym("")
     pr_tbl.add_row(pr_sym, v)
 
     test_failed = tests.cmd and not tests.running and tests.passed is False
@@ -792,7 +792,7 @@ def main():
                     view, show_help = "content", False
                 elif ch == "?":
                     show_help = not show_help
-                elif ch == "\r":
+                elif ch in ("\r", "\n"):
                     sup.force_refresh()
                 live.update(render(sup, console, version, view=view, show_help=show_help))
                 if ch is None:
