@@ -465,12 +465,12 @@ def time_ago(dt: Optional[datetime]) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     secs = max(0, int((now - dt).total_seconds()))
     if secs < 60:
-        return f"{secs}s ago"
+        return f"{secs}s"
     if secs < 3600:
-        return f"{secs // 60}m ago"
+        return f"{secs // 60}m"
     if secs < 86400:
-        return f"{secs // 3600}h ago"
-    return f"{secs // 86400}d ago"
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
 
 
 def _sym(state: str) -> Text:
@@ -506,17 +506,18 @@ def _ops_body(
     if git.error:
         tbl.add_row(_sym("bad"), Text(git.error, style="red"))
     else:
-        v = Text(git.branch, style="yellow")
+        v = Text()
+        if git.commit_time:
+            v.append(time_ago(git.commit_time), style="dim")
+            v.append("  ")
+        v.append(git.branch, style="yellow")
         if git.ahead:
             v.append(f" ↑{git.ahead}", style="green")
         if git.behind:
             v.append(f" ↓{git.behind}", style="red")
-        if git.commit_time or git.commit_msg:
-            v.append("\n  ")
-            if git.commit_time:
-                v.append(time_ago(git.commit_time), style="dim")
-            if git.commit_msg:
-                v.append(f"  {git.commit_msg}", style="dim italic")
+        if git.commit_msg:
+            v.append("  ")
+            v.append(git.commit_msg, style="dim italic")
         tbl.add_row(_sym("bad" if git.dirty else "good"), v)
 
     # ─ tests ─────────────────────────────────────────────────────────────────
@@ -527,26 +528,26 @@ def _ops_body(
             if tests.count:
                 v.append(f"  {tests.count}", style="dim")
             if tests.last_run:
-                v.append(f"  {time_ago(tests.last_run)}", style="dim")
                 v.append(f"  {tests.duration:.1f}s", style="dim")
             tbl.add_row(_sym("run"), v)
         elif tests.passed is None:
             v.append("—", style="dim")
             tbl.add_row(_sym(""), v)
         elif tests.passed:
-            if tests.count:
-                v.append(tests.count, style="")
-                v.append("  ", style="")
             if tests.last_run:
                 v.append(time_ago(tests.last_run), style="dim")
+                v.append("  ")
+            if tests.count:
+                v.append(tests.count, style="")
+            if tests.last_run:
                 v.append(f"  {tests.duration:.1f}s", style="dim")
             tbl.add_row(_sym("good"), v)
         else:
-            if tests.count:
-                v.append(tests.count, style="red")
-                v.append("  ", style="")
             if tests.last_run:
                 v.append(time_ago(tests.last_run), style="dim")
+                v.append("  ")
+            if tests.count:
+                v.append(tests.count, style="red")
             tbl.add_row(_sym("bad"), v)
 
     # ─ gh/pr (own table so test output can be inserted above it) ─────────────
@@ -565,9 +566,9 @@ def _ops_body(
     elif not prs.prs:
         if prs.fetching:
             v.append(f"{_elapsed(prs.fetch_started)}  ", style="dim")
+        elif prs.last_fetch:
+            v.append(f"{time_ago(prs.last_fetch)}  ", style="dim")
         v.append("none", style="dim")
-        if prs.last_fetch:
-            v.append(f"  {time_ago(prs.last_fetch)}", style="dim")
         pr_sym = _sym("run") if prs.fetching else _sym("good")
     else:
         if prs.fetching:
@@ -680,8 +681,8 @@ def _pkg_line(pkg: PackageState) -> Text:
     t = Text()
     if pkg.fetching and pkg.last_fetch is None:
         t.append("~", style="yellow")
-        t.append(f"  {label}")
         t.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
+        t.append(f"  {label}")
     elif pkg.published_version is None:
         t.append(" ")
         t.append(f"  {label}", style="dim")
@@ -694,12 +695,12 @@ def _pkg_line(pkg: PackageState) -> Text:
             t.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
         else:
             t.append("✓" if match else "✗", style="bold green" if match else "bold red")
+            if pkg.last_fetch:
+                t.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
         t.append(f"  {label}")
         if local and local != published and _version_gt(local, published):
             t.append(f"  ↑{local}", style="green")
         t.append(f"  {published}", style="dim")
-        if pkg.last_fetch and not pkg.fetching:
-            t.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
     return t
 
 
