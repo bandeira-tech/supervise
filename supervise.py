@@ -159,6 +159,7 @@ class Supervisor:
         self._stop = threading.Event()
         self._pr_wake = threading.Event()
         self._pkg_wake = threading.Event()
+        self._test_wake = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
         self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
         if self._pkg_info:
@@ -174,10 +175,15 @@ class Supervisor:
         self._stop.set()
         self._pr_wake.set()
         self._pkg_wake.set()
+        self._test_wake.set()
 
     def force_refresh(self):
         self._pr_wake.set()
         self._pkg_wake.set()
+        with self._lock:
+            tests_broken = self.tests.passed is False and not self.tests.running
+        if tests_broken:
+            self._test_wake.set()
 
     def _git_loop(self):
         while not self._stop.is_set():
@@ -244,12 +250,14 @@ class Supervisor:
         prev = self._scan_mtimes()
         self._run_tests()
         while not self._stop.is_set():
-            self._stop.wait(2)
+            forced = self._test_wake.wait(timeout=2)
+            self._test_wake.clear()
             curr = self._scan_mtimes()
-            if curr != prev:
+            if curr != prev or forced:
                 prev = self._scan_mtimes()  # rescan after any settle
                 self._run_tests()
-                self._stop.wait(10)         # cooldown: ignore churn from the run itself
+                self._test_wake.wait(timeout=10)  # cooldown: ignore churn from the run itself
+                self._test_wake.clear()
 
     def _run_tests(self):
         with self._lock:
