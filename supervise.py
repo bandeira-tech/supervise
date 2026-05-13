@@ -22,12 +22,10 @@ from typing import Optional
 
 from rich.console import Console, Group
 from rich.live import Live
-from rich.panel import Panel
 from rich.rule import Rule
 from rich.style import Style
 from rich.table import Table
 from rich.text import Text
-from rich import box
 
 
 def run(cmd: list[str], cwd=None, timeout=60) -> tuple[int, str, str]:
@@ -686,15 +684,16 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         h.append("  content", style="dim")
         body_parts.append(h)
 
-    return Panel(
-        Group(*top_parts, *body_parts),
-        title=f"[bold {color}]{target.name}[/]",
-        subtitle=f"[dim]{version}[/]" if version else None,
-        subtitle_align="right",
-        border_style=color,
-        box=box.ROUNDED,
-        padding=(0, 1),
+    bar = Table(
+        show_header=False, box=None,
+        expand=True, padding=(0, 1, 0, 1),
+        show_edge=False, pad_edge=False,
     )
+    bar.add_column("name", ratio=1, style=f"bold on {color}", no_wrap=True, overflow="ellipsis")
+    bar.add_column("ver",           style=f"dim on {color}",  no_wrap=True)
+    bar.add_row(target.name, version or "")
+
+    return Group(bar, *top_parts, *body_parts)
 
 
 def main():
@@ -759,7 +758,8 @@ def main():
                 elif ch == "?":
                     show_help = not show_help
                 live.update(render(sup, console, version, view=view, show_help=show_help))
-                time.sleep(args.refresh)
+                if ch is None:
+                    time.sleep(args.refresh)
     except KeyboardInterrupt:
         pass
     finally:
