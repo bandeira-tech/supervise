@@ -10,6 +10,9 @@ import subprocess
 import sys
 import threading
 import time
+import select
+import termios
+import tty
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -649,7 +652,7 @@ def _pkg_line(pkg: PackageState) -> Text:
     return t
 
 
-def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops") -> Panel:
+def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False) -> Panel:
     git, tests, prs, pkg = sup.snapshot()
     target = sup.target
 
@@ -673,6 +676,15 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
     else:
         body_parts, color = _ops_body(git, tests, prs, console)
         top_parts = [header, spacer]
+
+    if show_help:
+        body_parts.append(Rule(style="dim"))
+        h = Text()
+        h.append("1", style="bold")
+        h.append("  ops    ", style="dim")
+        h.append("2", style="bold")
+        h.append("  content", style="dim")
+        body_parts.append(h)
 
     return Panel(
         Group(*top_parts, *body_parts),
@@ -712,9 +724,23 @@ def main():
     sup.start()
 
     console = Console()
+    view = args.view
+    show_help = False
     reload_needed = False
+
+    raw_mode = sys.stdin.isatty()
+    fd = sys.stdin.fileno() if raw_mode else -1
+    old_term = termios.tcgetattr(fd) if raw_mode else None
+    if raw_mode:
+        tty.setraw(fd)
+
+    def _read_key() -> Optional[str]:
+        if raw_mode and select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
+
     try:
-        with Live(render(sup, console, version, view=args.view), console=console, refresh_per_second=1) as live:
+        with Live(render(sup, console, version, view=view, show_help=show_help), console=console, refresh_per_second=1) as live:
             while True:
                 if script_mtime is not None:
                     try:
@@ -723,11 +749,22 @@ def main():
                             break
                     except OSError:
                         pass
-                live.update(render(sup, console, version, view=args.view))
+                ch = _read_key()
+                if ch in ("\x03", "\x04"):   # Ctrl-C / Ctrl-D
+                    break
+                elif ch == "1":
+                    view, show_help = "ops", False
+                elif ch == "2":
+                    view, show_help = "content", False
+                elif ch == "?":
+                    show_help = not show_help
+                live.update(render(sup, console, version, view=view, show_help=show_help))
                 time.sleep(args.refresh)
     except KeyboardInterrupt:
         pass
     finally:
+        if raw_mode and old_term is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         sup.stop()
 
     if reload_needed:
