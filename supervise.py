@@ -85,6 +85,7 @@ class GitState:
     remote_url: Optional[str] = None
     ahead: int = 0
     behind: int = 0
+    worktrees: list[tuple[str, str]] = field(default_factory=list)  # (branch, abs_path)
     error: Optional[str] = None
 
 
@@ -223,6 +224,8 @@ class Supervisor:
                     _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
                     self._remote_url = _parse_github_url(remote.strip()) or ""
                 g.remote_url = self._remote_url or None
+                _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
+                g.worktrees = _parse_worktrees(wt_out, self.target)
             with self._lock:
                 self.git = g
             self._stop.wait(2)
@@ -346,6 +349,35 @@ class Supervisor:
     def snapshot(self):
         with self._lock:
             return self.git, self.tests, self.prs, self.pkg
+
+
+def _parse_worktrees(porcelain: str, target: Path) -> list[tuple[str, str]]:
+    """Parse `git worktree list --porcelain`; exclude the target itself."""
+    result: list[tuple[str, str]] = []
+    path: Optional[str] = None
+    branch: Optional[str] = None
+    target_str = str(target)
+    for line in porcelain.splitlines() + [""]:
+        if not line.strip():
+            if path and path != target_str:
+                result.append((branch or "(detached)", path))
+            path, branch = None, None
+            continue
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            branch = ref.removeprefix("refs/heads/")
+    return result
+
+
+def _display_path(p: str) -> str:
+    home = str(Path.home())
+    if p.startswith(home + "/"):
+        return "~/" + p[len(home) + 1:]
+    if p == home:
+        return "~"
+    return p
 
 
 def _parse_github_url(remote: str) -> Optional[str]:
@@ -560,10 +592,14 @@ def _ops_body(
     pr_tbl.add_column("sym",   width=1,  no_wrap=True, min_width=1, max_width=1)
     pr_tbl.add_column("value", ratio=1,  no_wrap=True, overflow="ellipsis")
     v = Text()
+    wt_by_branch = {b: p for b, p in git.worktrees}
+    pr_branches = {pr.get("headRefName") for pr in prs.prs}
+    standalone_wts = [(b, p) for b, p in git.worktrees if b not in pr_branches]
+    has_any = bool(prs.prs) or bool(standalone_wts)
     if prs.fetching and prs.last_fetch is None:
         v.append(_elapsed(prs.fetch_started), style="dim")
         pr_sym = _sym("run")
-    elif not prs.prs:
+    elif not has_any:
         if prs.fetching:
             v.append(f"{_elapsed(prs.fetch_started)}  ", style="dim")
         elif prs.last_fetch:
@@ -573,16 +609,33 @@ def _ops_body(
     else:
         if prs.fetching:
             v.append(f"{_elapsed(prs.fetch_started)}", style="dim")
-        for i, pr in enumerate(prs.prs[:5]):
+        row_idx = 0
+        for pr in prs.prs[:5]:
             author = (pr.get("author") or {}).get("login", "")
             pr_url = f"{git.remote_url}/pull/{pr['number']}" if git.remote_url else None
-            is_current = pr.get("headRefName") == git.branch
-            if i > 0 or prs.fetching:
+            branch = pr.get("headRefName")
+            is_current = branch == git.branch
+            wt_path = wt_by_branch.get(branch)
+            if row_idx > 0 or prs.fetching:
                 v.append("\n")
             v.append("▸  " if is_current else "   ")
-            v.append(f"#{pr['number']} {pr['title'][:60]}", style=Style(link=pr_url) if pr_url else Style())
-            if author:
-                v.append(f"  {author}", style="dim")
+            link_style = Style(link=pr_url) if pr_url else Style()
+            if wt_path:
+                v.append(f"#{pr['number']} {branch}", style=link_style)
+                v.append(f"  {_display_path(wt_path)}", style="dim cyan")
+            else:
+                v.append(f"#{pr['number']} {pr['title'][:60]}", style=link_style)
+                if author:
+                    v.append(f"  {author}", style="dim")
+            row_idx += 1
+        for branch, path in standalone_wts:
+            is_current = branch == git.branch
+            if row_idx > 0 or prs.fetching:
+                v.append("\n")
+            v.append("▸  " if is_current else "   ")
+            v.append(branch, style="yellow")
+            v.append(f"  {_display_path(path)}", style="dim cyan")
+            row_idx += 1
         pr_sym = _sym("run") if prs.fetching else _sym("")
     pr_tbl.add_row(pr_sym, v)
 
@@ -689,17 +742,23 @@ def _pkg_line(pkg: PackageState) -> Text:
     else:
         local = pkg.local_version
         published = pkg.published_version
-        match = (local == published) if local else True
+        if local:
+            ahead = _version_gt(local, published)
+            sym = "✓" if local == published else ("↑" if ahead else "✗")
+            sym_style = "bold red" if (local != published and not ahead) else "bold green"
+        else:
+            ahead = False
+            sym, sym_style = "✓", "bold green"
         if pkg.fetching:
             t.append("~", style="yellow")
             t.append(f"  {_elapsed(pkg.fetch_started)}", style="dim")
         else:
-            t.append("✓" if match else "✗", style="bold green" if match else "bold red")
+            t.append(sym, style=sym_style)
             if pkg.last_fetch:
                 t.append(f"  {time_ago(pkg.last_fetch)}", style="dim")
         t.append(f"  {label}")
-        if local and local != published and _version_gt(local, published):
-            t.append(f"  ↑{local}", style="green")
+        if local and ahead:
+            t.append(f"  {local}", style="green")
         t.append(f"  {published}", style="dim")
     return t
 
