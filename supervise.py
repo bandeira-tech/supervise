@@ -85,7 +85,7 @@ class GitState:
     remote_url: Optional[str] = None
     ahead: int = 0
     behind: int = 0
-    worktrees: list[tuple[str, str]] = field(default_factory=list)  # (branch, abs_path)
+    worktrees: list[tuple[str, str, bool]] = field(default_factory=list)  # (branch, abs_path, merged)
     error: Optional[str] = None
 
 
@@ -162,6 +162,7 @@ class Supervisor:
         self._pkg_wake = threading.Event()
         self._test_wake = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
+        self._default_ref: Optional[str] = None  # cached "origin/main" or similar
         self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
         if self._pkg_info:
             registry, name, local_version = self._pkg_info
@@ -225,7 +226,13 @@ class Supervisor:
                     self._remote_url = _parse_github_url(remote.strip()) or ""
                 g.remote_url = self._remote_url or None
                 _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
-                g.worktrees = _parse_worktrees(wt_out, self.target)
+                if self._default_ref is None:
+                    _, sym, _ = run(
+                        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                        cwd=self.target,
+                    )
+                    self._default_ref = sym.strip() or "origin/main"
+                g.worktrees = _parse_worktrees(wt_out, self.target, self._default_ref)
             with self._lock:
                 self.git = g
             self._stop.wait(2)
@@ -351,16 +358,24 @@ class Supervisor:
             return self.git, self.tests, self.prs, self.pkg
 
 
-def _parse_worktrees(porcelain: str, target: Path) -> list[tuple[str, str]]:
+def _parse_worktrees(porcelain: str, target: Path, default_ref: str) -> list[tuple[str, str, bool]]:
     """Parse `git worktree list --porcelain`; exclude the target itself."""
-    result: list[tuple[str, str]] = []
+    result: list[tuple[str, str, bool]] = []
     path: Optional[str] = None
     branch: Optional[str] = None
     target_str = str(target)
     for line in porcelain.splitlines() + [""]:
         if not line.strip():
             if path and path != target_str:
-                result.append((branch or "(detached)", path))
+                b = branch or "(detached)"
+                merged = False
+                if branch:
+                    rc, _, _ = run(
+                        ["git", "merge-base", "--is-ancestor", branch, default_ref],
+                        cwd=target,
+                    )
+                    merged = rc == 0
+                result.append((b, path, merged))
             path, branch = None, None
             continue
         if line.startswith("worktree "):
@@ -592,9 +607,9 @@ def _ops_body(
     pr_tbl.add_column("sym",   width=1,  no_wrap=True, min_width=1, max_width=1)
     pr_tbl.add_column("value", ratio=1,  no_wrap=True, overflow="ellipsis")
     v = Text()
-    wt_by_branch = {b: p for b, p in git.worktrees}
+    wt_by_branch = {b: (p, m) for b, p, m in git.worktrees}
     pr_branches = {pr.get("headRefName") for pr in prs.prs}
-    standalone_wts = [(b, p) for b, p in git.worktrees if b not in pr_branches]
+    standalone_wts = [(b, p, m) for b, p, m in git.worktrees if b not in pr_branches]
     has_any = bool(prs.prs) or bool(standalone_wts)
     if prs.fetching and prs.last_fetch is None:
         v.append(_elapsed(prs.fetch_started), style="dim")
@@ -615,25 +630,30 @@ def _ops_body(
             pr_url = f"{git.remote_url}/pull/{pr['number']}" if git.remote_url else None
             branch = pr.get("headRefName")
             is_current = branch == git.branch
-            wt_path = wt_by_branch.get(branch)
+            wt_entry = wt_by_branch.get(branch)
             if row_idx > 0 or prs.fetching:
                 v.append("\n")
             v.append("▸  " if is_current else "   ")
             link_style = Style(link=pr_url) if pr_url else Style()
-            if wt_path:
+            if wt_entry:
+                wt_path, wt_merged = wt_entry
                 v.append(f"#{pr['number']} {branch}", style=link_style)
+                if wt_merged:
+                    v.append(" ✗", style="bold red")
                 v.append(f"  {_display_path(wt_path)}", style="dim cyan")
             else:
                 v.append(f"#{pr['number']} {pr['title'][:60]}", style=link_style)
                 if author:
                     v.append(f"  {author}", style="dim")
             row_idx += 1
-        for branch, path in standalone_wts:
+        for branch, path, merged in standalone_wts:
             is_current = branch == git.branch
             if row_idx > 0 or prs.fetching:
                 v.append("\n")
             v.append("▸  " if is_current else "   ")
             v.append(branch, style="yellow")
+            if merged:
+                v.append(" ✗", style="bold red")
             v.append(f"  {_display_path(path)}", style="dim cyan")
             row_idx += 1
         pr_sym = _sym("run") if prs.fetching else _sym("")
