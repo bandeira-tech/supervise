@@ -111,6 +111,100 @@ class PRState:
 
 
 @dataclass
+class Issue:
+    id: str
+    kind: str
+    title: str
+    detected_at: datetime
+    state: str = "open"  # open | running | fixed | failed
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    _action: object = None  # callable returning (rc, out, err) or None
+
+
+class IssueStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._issues: dict[str, Issue] = {}
+        self._listeners: list = []
+
+    def subscribe(self, fn):
+        with self._lock:
+            self._listeners.append(fn)
+
+    def _emit(self, event: str, issue: Issue):
+        for fn in list(self._listeners):
+            try:
+                fn(event, issue)
+            except Exception:
+                pass
+
+    def reconcile(self, detected: list[Issue]):
+        events: list[tuple[str, Issue]] = []
+        with self._lock:
+            ids_now = {i.id for i in detected}
+            for id_ in list(self._issues):
+                cur = self._issues[id_]
+                if cur.state == "open" and id_ not in ids_now:
+                    events.append(("vanished", cur))
+                    del self._issues[id_]
+            for new in detected:
+                cur = self._issues.get(new.id)
+                if cur is None:
+                    self._issues[new.id] = new
+                    events.append(("detected", new))
+                elif cur.state == "fixed":
+                    self._issues[new.id] = new
+                    events.append(("reopened", new))
+                else:
+                    cur.title = new.title
+                    cur._action = new._action
+        for ev, iss in events:
+            self._emit(ev, iss)
+
+    def start(self, id_: str) -> bool:
+        with self._lock:
+            iss = self._issues.get(id_)
+            if iss is None or iss.state == "running":
+                return False
+            iss.state = "running"
+            iss.error = None
+            iss.started_at = datetime.now(tz=timezone.utc)
+            snap = iss
+        self._emit("started", snap)
+        return True
+
+    def finish(self, id_: str, error: Optional[str] = None):
+        with self._lock:
+            iss = self._issues.get(id_)
+            if iss is None:
+                return
+            iss.finished_at = datetime.now(tz=timezone.utc)
+            iss.state = "failed" if error else "fixed"
+            iss.error = error
+            snap = iss
+        self._emit("failed" if error else "fixed", snap)
+
+    def action_for(self, id_: str):
+        with self._lock:
+            iss = self._issues.get(id_)
+            return iss._action if iss else None
+
+    def snapshot(self) -> tuple[list[Issue], list[Issue], list[Issue]]:
+        with self._lock:
+            issues = list(self._issues.values())
+        opens = [i for i in issues if i.state in ("open", "running")]
+        failed = [i for i in issues if i.state == "failed"]
+        fixed = sorted(
+            [i for i in issues if i.state == "fixed"],
+            key=lambda i: i.finished_at or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        return opens, failed, fixed
+
+
+@dataclass
 class PackageState:
     name: Optional[str] = None
     registry: str = "npm"               # "npm" or "jsr"
@@ -157,6 +251,9 @@ class Supervisor:
         self.tests = TestState(cmd=detect_test_cmd(target))
         self.prs = PRState()
         self.pkg = PackageState()
+        self.issues = IssueStore()
+        self._action_row_map: dict[int, str] = {}
+        self._action_key_map: dict[str, str] = {}
         self._stop = threading.Event()
         self._pr_wake = threading.Event()
         self._pkg_wake = threading.Event()
@@ -235,6 +332,8 @@ class Supervisor:
                 g.worktrees = _parse_worktrees(wt_out, self.target, self._default_ref)
             with self._lock:
                 self.git = g
+            if not g.error:
+                self.issues.reconcile(_detect_issues(self.target, g))
             self._stop.wait(2)
 
     def _scan_mtimes(self) -> dict:
@@ -357,6 +456,31 @@ class Supervisor:
         with self._lock:
             return self.git, self.tests, self.prs, self.pkg
 
+    def execute_issue(self, id_: str):
+        action = self.issues.action_for(id_)
+        if action is None:
+            return
+        if not self.issues.start(id_):
+            return
+
+        def _run():
+            try:
+                result = action()
+                if isinstance(result, tuple) and len(result) == 3:
+                    rc, out, err = result
+                    if rc == 0:
+                        self.issues.finish(id_)
+                    else:
+                        msg = (err or out or f"exit {rc}").strip().splitlines()
+                        self.issues.finish(id_, error=msg[0] if msg else f"exit {rc}")
+                else:
+                    self.issues.finish(id_)
+            except Exception as e:
+                self.issues.finish(id_, error=str(e))
+            self._pr_wake.set()
+
+        threading.Thread(target=_run, daemon=True).start()
+
 
 def _parse_worktrees(porcelain: str, target: Path, default_ref: str) -> list[tuple[str, str, bool]]:
     """Parse `git worktree list --porcelain`; exclude the target itself."""
@@ -384,6 +508,46 @@ def _parse_worktrees(porcelain: str, target: Path, default_ref: str) -> list[tup
             ref = line[len("branch "):].strip()
             branch = ref.removeprefix("refs/heads/")
     return result
+
+
+def _make_wt_remove(repo: Path, wt_path: str, branch: str):
+    def action():
+        rc, out, err = run(["git", "worktree", "remove", wt_path], cwd=repo, timeout=30)
+        if rc != 0:
+            return rc, out, err
+        return run(["git", "branch", "-D", branch], cwd=repo, timeout=10)
+    return action
+
+
+def _detect_issues(target: Path, g: GitState) -> list[Issue]:
+    now = datetime.now(tz=timezone.utc)
+    issues: list[Issue] = []
+    if g.ahead > 0:
+        issues.append(Issue(
+            id="remote-push",
+            kind="remote-push",
+            title=f"local ↑{g.ahead} — push",
+            detected_at=now,
+            _action=lambda: run(["git", "push"], cwd=target, timeout=60),
+        ))
+    if g.behind > 0:
+        issues.append(Issue(
+            id="remote-pull",
+            kind="remote-pull",
+            title=f"remote ↓{g.behind} — pull -r",
+            detected_at=now,
+            _action=lambda: run(["git", "pull", "--rebase"], cwd=target, timeout=120),
+        ))
+    for branch, path, merged in g.worktrees:
+        if merged and branch != "(detached)":
+            issues.append(Issue(
+                id=f"wt-merged:{branch}",
+                kind="wt-merged",
+                title=f"{branch} merged — remove worktree + branch",
+                detected_at=now,
+                _action=_make_wt_remove(target, path, branch),
+            ))
+    return issues
 
 
 def _display_path(p: str) -> str:
@@ -783,6 +947,93 @@ def _pkg_line(pkg: PackageState) -> Text:
     return t
 
 
+def _issue_table() -> Table:
+    tbl = Table(
+        show_header=False, box=None,
+        pad_edge=False, show_edge=False,
+        padding=(0, 1, 0, 0),
+        expand=True,
+    )
+    tbl.add_column("key", width=1, no_wrap=True, min_width=1, max_width=1)
+    tbl.add_column("sym", width=1, no_wrap=True, min_width=1, max_width=1)
+    tbl.add_column("value", ratio=1, no_wrap=True, overflow="ellipsis")
+    return tbl
+
+
+def _action_body(
+    opens: list[Issue], failed: list[Issue], fixed: list[Issue],
+) -> tuple[list, str, dict[int, str], dict[str, str]]:
+    parts: list = []
+    row_map: dict[int, str] = {}
+    key_map: dict[str, str] = {}
+    body_row = 0
+    letters = "abcdefghijklmnopqrstuvwxyz"
+
+    def _next_key() -> str:
+        idx = len(key_map)
+        return letters[idx] if idx < len(letters) else ""
+
+    if failed:
+        tbl = _issue_table()
+        for iss in failed:
+            v = Text()
+            v.append(iss.title)
+            if iss.error:
+                v.append(f"  {iss.error}", style="dim red")
+            key = _next_key()
+            if key:
+                key_map[key] = iss.id
+            tbl.add_row(Text(key, style="bold cyan"), _sym("bad"), v)
+            row_map[body_row] = iss.id
+            body_row += 1
+        parts.append(tbl)
+        parts.append(Rule(style="dim red"))
+        body_row += 1
+
+    if opens:
+        tbl = _issue_table()
+        for iss in opens:
+            v = Text()
+            if iss.state == "running":
+                v.append(_elapsed(iss.started_at), style="dim")
+                v.append("  ")
+                v.append(iss.title)
+                sym = _sym("run")
+                key_text = Text(" ")
+            else:
+                v.append(iss.title)
+                sym = Text("▶", style="bold cyan")
+                key = _next_key()
+                if key:
+                    key_map[key] = iss.id
+                key_text = Text(key, style="bold cyan")
+            tbl.add_row(key_text, sym, v)
+            row_map[body_row] = iss.id
+            body_row += 1
+        parts.append(tbl)
+    elif not failed:
+        parts.append(Text("  no issues", style="dim green"))
+        body_row += 1
+
+    if fixed:
+        parts.append(Rule(style="dim green"))
+        body_row += 1
+        tbl = _issue_table()
+        for iss in fixed[:10]:
+            v = Text()
+            if iss.finished_at:
+                v.append(time_ago(iss.finished_at), style="dim")
+                v.append("  ")
+            v.append(iss.title, style="dim")
+            tbl.add_row(Text(" "), _sym("good"), v)
+            body_row += 1
+        parts.append(tbl)
+
+    has_open = any(i.state == "open" for i in opens)
+    color = "red" if failed else ("yellow" if has_open else "green")
+    return parts, color, row_map, key_map
+
+
 def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False) -> Group:
     git, tests, prs, pkg = sup.snapshot()
     target = sup.target
@@ -804,6 +1055,13 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
     if view == "content":
         body_parts, color = _content_body(target)
         top_parts: list = []
+    elif view == "action":
+        opens, failed, fixed = sup.issues.snapshot()
+        body_parts, color, body_row_map, body_key_map = _action_body(opens, failed, fixed)
+        top_parts = []  # no fs/gh/pkg header in action view
+        # Screen row layout: 1=bar → body starts at row 2
+        sup._action_row_map = {br + 2: iid for br, iid in body_row_map.items()}
+        sup._action_key_map = body_key_map
     else:
         body_parts, color = _ops_body(git, tests, prs, console)
         top_parts = [header, spacer]
@@ -815,10 +1073,16 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         h.append("  ops    ", style="dim")
         h.append("2", style="bold")
         h.append("  content    ", style="dim")
+        h.append("3", style="bold")
+        h.append("  action    ", style="dim")
         h.append("!", style="bold")
         h.append("  refresh ops    ", style="dim")
         h.append("@", style="bold")
-        h.append("  refresh content", style="dim")
+        h.append("  refresh content    ", style="dim")
+        h.append("#", style="bold")
+        h.append("  refresh action    ", style="dim")
+        h.append("a-z", style="bold")
+        h.append("  run issue", style="dim")
         body_parts.append(h)
 
     bar = Table(
@@ -826,9 +1090,11 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         expand=True, padding=(0, 1, 0, 1),
         show_edge=False, pad_edge=False,
     )
+    view_num = {"ops": "1", "content": "2", "action": "3"}.get(view, "")
+    bar.add_column("v",    style=f"bold on {color}", no_wrap=True)
     bar.add_column("name", ratio=1, style=f"bold on {color}", no_wrap=True, overflow="ellipsis")
     bar.add_column("ver",           style=f"dim on {color}",  no_wrap=True)
-    bar.add_row(target.name, version or "")
+    bar.add_row(view_num, target.name, version or "")
 
     return Group(bar, *top_parts, *body_parts)
 
@@ -839,7 +1105,7 @@ def main():
         description="Continuous project status dashboard",
     )
     ap.add_argument("target", nargs="?", default=".", help="project directory (default: cwd)")
-    ap.add_argument("-v", "--view", choices=["ops", "content"], default="ops", metavar="VIEW", help="view mode: ops (default) or content")
+    ap.add_argument("-v", "--view", choices=["ops", "content", "action"], default="ops", metavar="VIEW", help="view mode: ops (default), content, or action")
     ap.add_argument("--pr-interval", type=int, default=300, metavar="N", help="seconds between PR fetches (default: 300)")
     ap.add_argument("--refresh", type=float, default=1.0, metavar="S", help="display refresh rate in seconds (default: 1)")
     args = ap.parse_args()
@@ -891,7 +1157,9 @@ def main():
         return None  # unrecognised escape sequence
 
     def _click_map() -> dict[int, str]:
-        """Map screen row (1-indexed) → action for left-column clicks in ops view."""
+        """Map screen row (1-indexed) → action token."""
+        if view == "action":
+            return {row: f"issue:{iid}" for row, iid in sup._action_row_map.items()}
         if view != "ops":
             return {}
         # row 1: title bar, row 2: header, row 3: spacer, row 4: git
@@ -904,7 +1172,7 @@ def main():
         return result
 
     try:
-        with Live(render(sup, console, version, view=view, show_help=show_help), console=console, refresh_per_second=1) as live:
+        with Live(render(sup, console, version, view=view, show_help=show_help), console=console, refresh_per_second=1, screen=True) as live:
             while True:
                 if script_mtime is not None:
                     try:
@@ -918,11 +1186,13 @@ def main():
                     time.sleep(args.refresh)
                 elif isinstance(event, tuple) and event[0] == "mouse":
                     _, btn, col, row, pressed = event
-                    if btn == 0 and pressed and col <= 4:
+                    if btn == 0 and pressed:
                         action = _click_map().get(row)
-                        if action == "tests":
+                        if action and action.startswith("issue:"):
+                            sup.execute_issue(action[len("issue:"):])
+                        elif col <= 4 and action == "tests":
                             sup._test_wake.set()
-                        elif action == "prs":
+                        elif col <= 4 and action == "prs":
                             sup._pr_wake.set()
                 elif isinstance(event, str):
                     ch = event
@@ -932,14 +1202,21 @@ def main():
                         view, show_help = "ops", False
                     elif ch == "2":
                         view, show_help = "content", False
+                    elif ch == "3":
+                        view, show_help = "action", False
                     elif ch == "!":   # Shift+1 — switch to ops + full refresh
                         view, show_help = "ops", False
                         sup.force_refresh()
                     elif ch == "@":   # Shift+2 — switch to content + full refresh
                         view, show_help = "content", False
                         sup.force_refresh()
+                    elif ch == "#":   # Shift+3 — switch to action + full refresh
+                        view, show_help = "action", False
+                        sup.force_refresh()
                     elif ch == "?":
                         show_help = not show_help
+                    elif view == "action" and ch in sup._action_key_map:
+                        sup.execute_issue(sup._action_key_map[ch])
                 live.update(render(sup, console, version, view=view, show_help=show_help))
     except KeyboardInterrupt:
         pass
