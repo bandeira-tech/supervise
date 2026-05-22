@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -124,10 +125,11 @@ class Issue:
 
 
 class IssueStore:
-    def __init__(self):
+    def __init__(self, on_change=None):
         self._lock = threading.Lock()
         self._issues: dict[str, Issue] = {}
         self._listeners: list = []
+        self._on_change = on_change
 
     def subscribe(self, fn):
         with self._lock:
@@ -137,6 +139,13 @@ class IssueStore:
         for fn in list(self._listeners):
             try:
                 fn(event, issue)
+            except Exception:
+                pass
+
+    def _changed(self):
+        if self._on_change is not None:
+            try:
+                self._on_change()
             except Exception:
                 pass
 
@@ -162,6 +171,8 @@ class IssueStore:
                     cur._action = new._action
         for ev, iss in events:
             self._emit(ev, iss)
+        if events:
+            self._changed()
 
     def start(self, id_: str) -> bool:
         with self._lock:
@@ -173,6 +184,7 @@ class IssueStore:
             iss.started_at = datetime.now(tz=timezone.utc)
             snap = iss
         self._emit("started", snap)
+        self._changed()
         return True
 
     def finish(self, id_: str, error: Optional[str] = None):
@@ -185,6 +197,7 @@ class IssueStore:
             iss.error = error
             snap = iss
         self._emit("failed" if error else "fixed", snap)
+        self._changed()
 
     def action_for(self, id_: str):
         with self._lock:
@@ -251,19 +264,39 @@ class Supervisor:
         self.tests = TestState(cmd=detect_test_cmd(target))
         self.prs = PRState()
         self.pkg = PackageState()
-        self.issues = IssueStore()
+        self._counter = itertools.count(1)
+        self._version = 0
+        self.issues = IssueStore(on_change=self._bump)
         self._action_row_map: dict[int, str] = {}
         self._action_key_map: dict[str, str] = {}
         self._stop = threading.Event()
         self._pr_wake = threading.Event()
         self._pkg_wake = threading.Event()
         self._test_wake = threading.Event()
+        self._git_wake = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
         self._default_ref: Optional[str] = None  # cached "origin/main" or similar
+        self._mb_cache: dict[tuple[str, str], bool] = {}  # merge-base --is-ancestor results
+        self._git_meta_mtimes: dict[str, float] = {}
+        self._last_full_git_sweep: float = 0.0
         self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
         if self._pkg_info:
             registry, name, local_version = self._pkg_info
             self.pkg = PackageState(name=name, registry=registry, local_version=local_version)
+
+    def _bump(self):
+        self._version = next(self._counter)
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def is_animating(self) -> bool:
+        with self._lock:
+            if self.tests.running or self.prs.fetching or self.pkg.fetching:
+                return True
+        opens, _failed, _fixed = self.issues.snapshot()
+        return any(i.state == "running" for i in opens)
 
     def start(self):
         for fn in (self._git_loop, self._test_loop, self._pr_loop, self._pkg_loop):
@@ -275,66 +308,122 @@ class Supervisor:
         self._pr_wake.set()
         self._pkg_wake.set()
         self._test_wake.set()
+        self._git_wake.set()
 
     def force_refresh(self):
         self._pr_wake.set()
         self._pkg_wake.set()
+        self._git_wake.set()
         with self._lock:
             can_run = self.tests.cmd is not None and not self.tests.running
         if can_run:
             self._test_wake.set()
 
+    def _should_sweep_git(self) -> bool:
+        """Cheap mtime check: skip the subprocess sweep when nothing in .git changed
+        and we did a full sweep recently. Updates the meta-mtime cache as a side effect."""
+        git_dir = self.target / ".git"
+        paths = ("HEAD", "index", "FETCH_HEAD", "packed-refs", "refs/heads", "refs/remotes")
+        changed = False
+        refs_changed = False
+        for rel in paths:
+            try:
+                mt = (git_dir / rel).stat().st_mtime
+            except OSError:
+                mt = 0.0
+            prev = self._git_meta_mtimes.get(rel)
+            if prev != mt:
+                changed = True
+                if rel in ("packed-refs", "refs/heads", "refs/remotes"):
+                    refs_changed = True
+                self._git_meta_mtimes[rel] = mt
+        if refs_changed:
+            self._mb_cache.clear()
+        if changed:
+            return True
+        # Safety floor: full sweep every 5s even when nothing observable changed,
+        # to catch in-place file edits the working tree dirty status missed.
+        return (time.monotonic() - self._last_full_git_sweep) >= 5.0
+
+    def _is_merged(self, branch: str, default_ref: str) -> bool:
+        if branch == "(detached)":
+            return False
+        key = (branch, default_ref)
+        cached = self._mb_cache.get(key)
+        if cached is not None:
+            return cached
+        rc, _, _ = run(
+            ["git", "merge-base", "--is-ancestor", branch, default_ref],
+            cwd=self.target,
+        )
+        merged = rc == 0
+        self._mb_cache[key] = merged
+        return merged
+
+    def _git_sweep(self):
+        g = GitState()
+        rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.target)
+        if rc != 0:
+            g.error = "not a git repo"
+        else:
+            g.branch = out.strip()
+            _, status, _ = run(["git", "status", "--porcelain"], cwd=self.target)
+            g.dirty = bool(status.strip())
+            g.status_output = status
+            _, log, _ = run(
+                ["git", "log", "-1", "--format=%s\x1f%ct"],
+                cwd=self.target,
+            )
+            if log.strip():
+                parts = log.strip().split("\x1f")
+                g.commit_msg = parts[0].strip()
+                if len(parts) > 1:
+                    try:
+                        g.commit_time = datetime.fromtimestamp(int(parts[1]), tz=timezone.utc)
+                    except ValueError:
+                        pass
+            _, ab_out, _ = run(
+                ["git", "rev-list", "--count", "--left-right", "HEAD...@{u}"],
+                cwd=self.target,
+            )
+            if ab_out.strip():
+                ab_parts = ab_out.strip().split()
+                if len(ab_parts) == 2:
+                    try:
+                        g.ahead, g.behind = int(ab_parts[0]), int(ab_parts[1])
+                    except ValueError:
+                        pass
+            if self._remote_url is None:
+                _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
+                self._remote_url = _parse_github_url(remote.strip()) or ""
+            g.remote_url = self._remote_url or None
+            _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
+            if self._default_ref is None:
+                _, sym, _ = run(
+                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                    cwd=self.target,
+                )
+                self._default_ref = sym.strip() or "origin/main"
+            g.worktrees = [
+                (b, p, self._is_merged(b, self._default_ref))
+                for b, p in _parse_worktrees(wt_out, self.target)
+            ]
+        with self._lock:
+            changed = self.git != g
+            self.git = g
+        if changed:
+            self._bump()
+        if not g.error:
+            self.issues.reconcile(_detect_issues(self.target, g))
+        self._last_full_git_sweep = time.monotonic()
+
     def _git_loop(self):
         while not self._stop.is_set():
-            g = GitState()
-            rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.target)
-            if rc != 0:
-                g.error = "not a git repo"
-            else:
-                g.branch = out.strip()
-                _, status, _ = run(["git", "status", "--porcelain"], cwd=self.target)
-                g.dirty = bool(status.strip())
-                g.status_output = status
-                _, log, _ = run(
-                    ["git", "log", "-1", "--format=%s\x1f%ct"],
-                    cwd=self.target,
-                )
-                if log.strip():
-                    parts = log.strip().split("\x1f")
-                    g.commit_msg = parts[0].strip()
-                    if len(parts) > 1:
-                        try:
-                            g.commit_time = datetime.fromtimestamp(int(parts[1]), tz=timezone.utc)
-                        except ValueError:
-                            pass
-                _, ab_out, _ = run(
-                    ["git", "rev-list", "--count", "--left-right", "HEAD...@{u}"],
-                    cwd=self.target,
-                )
-                if ab_out.strip():
-                    ab_parts = ab_out.strip().split()
-                    if len(ab_parts) == 2:
-                        try:
-                            g.ahead, g.behind = int(ab_parts[0]), int(ab_parts[1])
-                        except ValueError:
-                            pass
-                if self._remote_url is None:
-                    _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
-                    self._remote_url = _parse_github_url(remote.strip()) or ""
-                g.remote_url = self._remote_url or None
-                _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
-                if self._default_ref is None:
-                    _, sym, _ = run(
-                        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                        cwd=self.target,
-                    )
-                    self._default_ref = sym.strip() or "origin/main"
-                g.worktrees = _parse_worktrees(wt_out, self.target, self._default_ref)
-            with self._lock:
-                self.git = g
-            if not g.error:
-                self.issues.reconcile(_detect_issues(self.target, g))
-            self._stop.wait(2)
+            woke = self._git_wake.is_set()
+            self._git_wake.clear()
+            if woke or self._should_sweep_git():
+                self._git_sweep()
+            self._git_wake.wait(timeout=2)
 
     def _scan_mtimes(self) -> dict:
         mtimes: dict = {}
@@ -359,10 +448,11 @@ class Supervisor:
         prev = self._scan_mtimes()
         self._run_tests()
         while not self._stop.is_set():
-            forced = self._test_wake.wait(timeout=2)
+            forced = self._test_wake.wait(timeout=5)
             self._test_wake.clear()
             curr = self._scan_mtimes()
             if curr != prev or forced:
+                self._git_wake.set()  # tree changed: let git loop refresh dirty/status
                 prev = self._scan_mtimes()  # rescan after any settle
                 self._run_tests()
                 self._test_wake.wait(timeout=10)  # cooldown: ignore churn from the run itself
@@ -375,6 +465,7 @@ class Supervisor:
             self.tests.running = True
             self.tests.run_started = datetime.now(tz=timezone.utc)
             cmd = self.tests.cmd
+        self._bump()
 
         start = time.monotonic()
         rc, stdout, stderr = run(cmd, cwd=self.target, timeout=300)
@@ -396,6 +487,7 @@ class Supervisor:
             self.tests.last_run = datetime.now(tz=timezone.utc)
             self.tests.duration = elapsed
             self.tests.count = test_count
+        self._bump()
 
     def _pr_loop(self):
         while not self._stop.is_set():
@@ -407,6 +499,7 @@ class Supervisor:
         with self._lock:
             self.prs.fetching = True
             self.prs.fetch_started = datetime.now(tz=timezone.utc)
+        self._bump()
 
         rc, out, err = run(
             ["gh", "pr", "list", "--json", "number,title,author,createdAt,headRefName", "--limit", "10"],
@@ -424,6 +517,7 @@ class Supervisor:
 
         with self._lock:
             self.prs = p
+        self._bump()
 
     def _pkg_loop(self):
         if not self._pkg_info:
@@ -443,6 +537,7 @@ class Supervisor:
             self.pkg.fetch_started = datetime.now(tz=timezone.utc)
             registry = self.pkg.registry
             name = self.pkg.name
+        self._bump()
 
         published = _fetch_published_version(registry, name)
 
@@ -451,6 +546,7 @@ class Supervisor:
             self.pkg.fetch_started = None
             self.pkg.published_version = published
             self.pkg.last_fetch = datetime.now(tz=timezone.utc)
+        self._bump()
 
     def snapshot(self):
         with self._lock:
@@ -482,24 +578,16 @@ class Supervisor:
         threading.Thread(target=_run, daemon=True).start()
 
 
-def _parse_worktrees(porcelain: str, target: Path, default_ref: str) -> list[tuple[str, str, bool]]:
+def _parse_worktrees(porcelain: str, target: Path) -> list[tuple[str, str]]:
     """Parse `git worktree list --porcelain`; exclude the target itself."""
-    result: list[tuple[str, str, bool]] = []
+    result: list[tuple[str, str]] = []
     path: Optional[str] = None
     branch: Optional[str] = None
     target_str = str(target)
     for line in porcelain.splitlines() + [""]:
         if not line.strip():
             if path and path != target_str:
-                b = branch or "(detached)"
-                merged = False
-                if branch:
-                    rc, _, _ = run(
-                        ["git", "merge-base", "--is-ancestor", branch, default_ref],
-                        cwd=target,
-                    )
-                    merged = rc == 0
-                result.append((b, path, merged))
+                result.append((branch or "(detached)", path))
             path, branch = None, None
             continue
         if line.startswith("worktree "):
@@ -1172,7 +1260,13 @@ def main():
         return result
 
     try:
-        with Live(render(sup, console, version, view=view, show_help=show_help), console=console, refresh_per_second=1, screen=True) as live:
+        with Live(
+            render(sup, console, version, view=view, show_help=show_help),
+            console=console,
+            auto_refresh=False,
+            screen=True,
+        ) as live:
+            last_version = -1
             while True:
                 if script_mtime is not None:
                     try:
@@ -1181,9 +1275,21 @@ def main():
                             break
                     except OSError:
                         pass
+
+                anim = sup.is_animating()
+                # Block on stdin up to sleep_dur — keystrokes wake instantly.
+                # When animating we re-render every second (timers tick); otherwise
+                # we can sleep longer and only repaint on real state changes.
+                sleep_dur = 1.0 if anim else args.refresh * 3.0
+                if raw_mode:
+                    select.select([sys.stdin], [], [], sleep_dur)
+                else:
+                    time.sleep(sleep_dur)
+
                 event = _read_input()
+                input_handled = False
                 if event is None:
-                    time.sleep(args.refresh)
+                    pass
                 elif isinstance(event, tuple) and event[0] == "mouse":
                     _, btn, col, row, pressed = event
                     if btn == 0 and pressed:
@@ -1194,6 +1300,7 @@ def main():
                             sup._test_wake.set()
                         elif col <= 4 and action == "prs":
                             sup._pr_wake.set()
+                        input_handled = True
                 elif isinstance(event, str):
                     ch = event
                     if ch in ("\x03", "\x04"):
@@ -1217,7 +1324,15 @@ def main():
                         show_help = not show_help
                     elif view == "action" and ch in sup._action_key_map:
                         sup.execute_issue(sup._action_key_map[ch])
-                live.update(render(sup, console, version, view=view, show_help=show_help))
+                    input_handled = True
+
+                cur_version = sup.version
+                if cur_version != last_version or input_handled or anim:
+                    live.update(
+                        render(sup, console, version, view=view, show_help=show_help),
+                        refresh=True,
+                    )
+                    last_version = cur_version
     except KeyboardInterrupt:
         pass
     finally:
