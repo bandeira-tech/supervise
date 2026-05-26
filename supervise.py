@@ -892,7 +892,7 @@ def _ops_body(
                 v.append(f"#{pr['number']} {branch}", style=link_style)
                 if wt_merged:
                     v.append(" ✗", style="bold red")
-                v.append(f"  {_display_path(wt_path)}", style="dim cyan")
+                v.append(f"  {_display_path(wt_path)}", style=Style(color="cyan", dim=True, link=f"file://{wt_path}"))
             else:
                 v.append(f"#{pr['number']} {pr['title'][:60]}", style=link_style)
                 if author:
@@ -906,7 +906,7 @@ def _ops_body(
             v.append(branch, style="yellow")
             if merged:
                 v.append(" ✗", style="bold red")
-            v.append(f"  {_display_path(path)}", style="dim cyan")
+            v.append(f"  {_display_path(path)}", style=Style(color="cyan", dim=True, link=f"file://{path}"))
             row_idx += 1
         pr_sym = _sym("run") if prs.fetching else _sym("")
     pr_tbl.add_row(pr_sym, v)
