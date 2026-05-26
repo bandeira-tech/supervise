@@ -789,8 +789,37 @@ def _script_version(script: Path) -> str:
         return ""
 
 
+def _status_text(status_output: str, target: Path) -> Text:
+    def _unquote(p: str) -> str:
+        return p[1:-1] if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p
+
+    def _append_path(t: Text, raw: str) -> None:
+        abs_path = (target / _unquote(raw)).resolve()
+        t.append(raw, style=Style(link=f"file://{abs_path}"))
+
+    t = Text(style="dim")
+    lines = status_output.rstrip().split("\n")
+    for i, line in enumerate(lines):
+        if i > 0:
+            t.append("\n")
+        if len(line) < 4:
+            t.append(line)
+            continue
+        t.append(line[:3])
+        rest = line[3:]
+        if " -> " in rest:
+            old, new = rest.split(" -> ", 1)
+            _append_path(t, old)
+            t.append(" -> ")
+            _append_path(t, new)
+        else:
+            _append_path(t, rest)
+    return t
+
+
 def _ops_body(
-    git: GitState, tests: TestState, prs: PRState, console: Optional[Console]
+    git: GitState, tests: TestState, prs: PRState, console: Optional[Console],
+    target: Path,
 ) -> tuple[list, str]:
     tbl = Table(
         show_header=False, box=None,
@@ -920,7 +949,7 @@ def _ops_body(
     parts.append(pr_tbl)
     if not test_failed and git.dirty and git.status_output:
         parts.append(Rule(style="dim yellow"))
-        parts.append(Text(git.status_output.rstrip(), style="dim"))
+        parts.append(_status_text(git.status_output, target))
 
     color = "red" if tests.passed is False else ("yellow" if git.dirty else "green")
     return parts, color
@@ -1122,7 +1151,7 @@ def _action_body(
     return parts, color, row_map, key_map
 
 
-def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False) -> Group:
+def render(sup: Supervisor, console: Optional[Console] = None, version: str = "", view: str = "ops", show_help: bool = False, reload_error: Optional[str] = None) -> Group:
     git, tests, prs, pkg = sup.snapshot()
     target = sup.target
 
@@ -1151,7 +1180,7 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
         sup._action_row_map = {br + 2: iid for br, iid in body_row_map.items()}
         sup._action_key_map = body_key_map
     else:
-        body_parts, color = _ops_body(git, tests, prs, console)
+        body_parts, color = _ops_body(git, tests, prs, console, sup.target)
         top_parts = [header, spacer]
 
     if show_help:
@@ -1182,7 +1211,13 @@ def render(sup: Supervisor, console: Optional[Console] = None, version: str = ""
     bar.add_column("v",    style=f"bold on {color}", no_wrap=True)
     bar.add_column("name", ratio=1, style=f"bold on {color}", no_wrap=True, overflow="ellipsis")
     bar.add_column("ver",           style=f"dim on {color}",  no_wrap=True)
-    bar.add_row(view_num, target.name, version or "")
+    name_cell: object = target.name
+    if reload_error:
+        nc = Text(target.name, style=f"bold on {color}")
+        nc.append("  ⚠ reload failed: ", style=f"bold yellow on {color}")
+        nc.append(reload_error[:80], style=f"yellow on {color}")
+        name_cell = nc
+    bar.add_row(view_num, name_cell, version or "")
 
     return Group(bar, *top_parts, *body_parts)
 
@@ -1196,12 +1231,18 @@ def main():
     ap.add_argument("-v", "--view", choices=["ops", "content", "action"], default="ops", metavar="VIEW", help="view mode: ops (default), content, or action")
     ap.add_argument("--pr-interval", type=int, default=300, metavar="N", help="seconds between PR fetches (default: 300)")
     ap.add_argument("--refresh", type=float, default=1.0, metavar="S", help="display refresh rate in seconds (default: 1)")
+    ap.add_argument("--self-check", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     target = Path(args.target).expanduser().resolve()
     if not target.is_dir():
         print(f"error: {target} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    if args.self_check:
+        sup = Supervisor(target, pr_interval=args.pr_interval)
+        render(sup, None, "", view=args.view, show_help=False)
+        sys.exit(0)
 
     script = Path(__file__).with_suffix(".py").resolve()
     try:
@@ -1217,6 +1258,20 @@ def main():
     view = args.view
     show_help = False
     reload_needed = False
+    reload_error: Optional[str] = None
+
+    def _validate_reload() -> Optional[str]:
+        try:
+            r = subprocess.run(
+                [sys.executable, str(script), "--self-check", str(target)],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            return f"self-check failed to launch: {e}"
+        if r.returncode == 0:
+            return None
+        msg = (r.stderr or r.stdout or "").strip().splitlines()
+        return msg[-1] if msg else f"exit {r.returncode}"
 
     raw_mode = sys.stdin.isatty()
     fd = sys.stdin.fileno() if raw_mode else -1
@@ -1261,7 +1316,7 @@ def main():
 
     try:
         with Live(
-            render(sup, console, version, view=view, show_help=show_help),
+            render(sup, console, version, view=view, show_help=show_help, reload_error=reload_error),
             console=console,
             auto_refresh=False,
             screen=True,
@@ -1270,11 +1325,20 @@ def main():
             while True:
                 if script_mtime is not None:
                     try:
-                        if script.stat().st_mtime != script_mtime:
+                        cur_mtime = script.stat().st_mtime
+                    except OSError:
+                        cur_mtime = script_mtime
+                    if cur_mtime != script_mtime:
+                        err = _validate_reload()
+                        if err is None:
                             reload_needed = True
                             break
-                    except OSError:
-                        pass
+                        reload_error = err
+                        script_mtime = cur_mtime  # don't keep retrying same broken file
+                        live.update(
+                            render(sup, console, version, view=view, show_help=show_help, reload_error=reload_error),
+                            refresh=True,
+                        )
 
                 anim = sup.is_animating()
                 # Block on stdin up to sleep_dur — keystrokes wake instantly.
@@ -1329,7 +1393,7 @@ def main():
                 cur_version = sup.version
                 if cur_version != last_version or input_handled or anim:
                     live.update(
-                        render(sup, console, version, view=view, show_help=show_help),
+                        render(sup, console, version, view=view, show_help=show_help, reload_error=reload_error),
                         refresh=True,
                     )
                     last_version = cur_version
