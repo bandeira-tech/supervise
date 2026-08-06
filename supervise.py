@@ -86,7 +86,8 @@ class GitState:
     remote_url: Optional[str] = None
     ahead: int = 0
     behind: int = 0
-    worktrees: list[tuple[str, str, bool]] = field(default_factory=list)  # (branch, abs_path, merged)
+    worktrees: list[tuple[str, str, bool, bool, Optional[int]]] = field(default_factory=list)
+    # (branch, abs_path, merged, locked, lock_pid_if_alive)
     error: Optional[str] = None
 
 
@@ -276,6 +277,7 @@ class Supervisor:
         self._git_wake = threading.Event()
         self._remote_url: Optional[str] = None  # None = not yet fetched, "" = no github remote
         self._default_ref: Optional[str] = None  # cached "origin/main" or similar
+        self._is_bare: Optional[bool] = None  # cached bare-repo check
         self._mb_cache: dict[tuple[str, str], bool] = {}  # merge-base --is-ancestor results
         self._git_meta_mtimes: dict[str, float] = {}
         self._last_full_git_sweep: float = 0.0
@@ -362,10 +364,26 @@ class Supervisor:
 
     def _git_sweep(self):
         g = GitState()
-        rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.target)
-        if rc != 0:
-            g.error = "not a git repo"
+        if self._is_bare is None:
+            rc, out, _ = run(["git", "rev-parse", "--is-bare-repository"], cwd=self.target)
+            self._is_bare = rc == 0 and out.strip() == "true"
+
+        if self._is_bare:
+            # No working tree at self.target: no branch/dirty/ahead-behind to report there.
+            # git commands that don't need a work tree (worktree list, remote, symbolic-ref)
+            # still work fine against the bare admin dir.
+            g.branch = "(bare)"
         else:
+            rc, out, _ = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.target)
+            if rc != 0:
+                g.error = "not a git repo"
+                with self._lock:
+                    changed = self.git != g
+                    self.git = g
+                if changed:
+                    self._bump()
+                self._last_full_git_sweep = time.monotonic()
+                return
             g.branch = out.strip()
             _, status, _ = run(["git", "status", "--porcelain"], cwd=self.target)
             g.dirty = bool(status.strip())
@@ -393,21 +411,22 @@ class Supervisor:
                         g.ahead, g.behind = int(ab_parts[0]), int(ab_parts[1])
                     except ValueError:
                         pass
-            if self._remote_url is None:
-                _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
-                self._remote_url = _parse_github_url(remote.strip()) or ""
-            g.remote_url = self._remote_url or None
-            _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
-            if self._default_ref is None:
-                _, sym, _ = run(
-                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-                    cwd=self.target,
-                )
-                self._default_ref = sym.strip() or "origin/main"
-            g.worktrees = [
-                (b, p, self._is_merged(b, self._default_ref))
-                for b, p in _parse_worktrees(wt_out, self.target)
-            ]
+
+        if self._remote_url is None:
+            _, remote, _ = run(["git", "remote", "get-url", "origin"], cwd=self.target)
+            self._remote_url = _parse_github_url(remote.strip()) or ""
+        g.remote_url = self._remote_url or None
+        _, wt_out, _ = run(["git", "worktree", "list", "--porcelain"], cwd=self.target)
+        if self._default_ref is None:
+            _, sym, _ = run(
+                ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                cwd=self.target,
+            )
+            self._default_ref = sym.strip() or "origin/main"
+        g.worktrees = [
+            (b, p, self._is_merged(b, self._default_ref), locked, live_pid)
+            for b, p, locked, live_pid in _parse_worktrees(wt_out, self.target)
+        ]
         with self._lock:
             changed = self.git != g
             self.git = g
@@ -578,28 +597,51 @@ class Supervisor:
         threading.Thread(target=_run, daemon=True).start()
 
 
-def _parse_worktrees(porcelain: str, target: Path) -> list[tuple[str, str]]:
-    """Parse `git worktree list --porcelain`; exclude the target itself."""
-    result: list[tuple[str, str]] = []
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours
+    return True
+
+
+def _parse_worktrees(porcelain: str, target: Path) -> list[tuple[str, str, bool, Optional[int]]]:
+    """Parse `git worktree list --porcelain`; exclude the target itself.
+    Returns (branch, abs_path, locked, lock_pid_if_alive)."""
+    result: list[tuple[str, str, bool, Optional[int]]] = []
     path: Optional[str] = None
     branch: Optional[str] = None
+    locked = False
+    lock_pid: Optional[int] = None
     target_str = str(target)
     for line in porcelain.splitlines() + [""]:
         if not line.strip():
             if path and path != target_str:
-                result.append((branch or "(detached)", path))
-            path, branch = None, None
+                result.append((branch or "(detached)", path, locked, lock_pid))
+            path, branch, locked, lock_pid = None, None, False, None
             continue
         if line.startswith("worktree "):
             path = line[len("worktree "):].strip()
         elif line.startswith("branch "):
             ref = line[len("branch "):].strip()
             branch = ref.removeprefix("refs/heads/")
+        elif line.startswith("locked"):
+            locked = True
+            m = re.search(r"\(pid (\d+)", line)
+            if m and _pid_alive(int(m.group(1))):
+                lock_pid = int(m.group(1))
     return result
 
 
-def _make_wt_remove(repo: Path, wt_path: str, branch: str):
+def _make_wt_remove(repo: Path, wt_path: str, branch: str, locked: bool):
     def action():
+        if locked:
+            # Lock outlived its process (checked stale before this ran) — clear it first.
+            rc, out, err = run(["git", "worktree", "unlock", wt_path], cwd=repo, timeout=10)
+            if rc != 0:
+                return rc, out, err
         rc, out, err = run(["git", "worktree", "remove", wt_path], cwd=repo, timeout=30)
         if rc != 0:
             return rc, out, err
@@ -626,14 +668,19 @@ def _detect_issues(target: Path, g: GitState) -> list[Issue]:
             detected_at=now,
             _action=lambda: run(["git", "pull", "--rebase"], cwd=target, timeout=120),
         ))
-    for branch, path, merged in g.worktrees:
+    for branch, path, merged, locked, live_pid in g.worktrees:
         if merged and branch != "(detached)":
+            if live_pid is not None:
+                continue  # session still running there — leave it alone
+            title = f"{branch} merged — remove worktree + branch"
+            if locked:
+                title = f"{branch} merged, stale lock — unlock + remove worktree + branch"
             issues.append(Issue(
                 id=f"wt-merged:{branch}",
                 kind="wt-merged",
-                title=f"{branch} merged — remove worktree + branch",
+                title=title,
                 detected_at=now,
-                _action=_make_wt_remove(target, path, branch),
+                _action=_make_wt_remove(target, path, branch, locked),
             ))
     return issues
 
@@ -888,9 +935,9 @@ def _ops_body(
     pr_tbl.add_column("sym",   width=1,  no_wrap=True, min_width=1, max_width=1)
     pr_tbl.add_column("value", ratio=1,  no_wrap=True, overflow="ellipsis")
     v = Text()
-    wt_by_branch = {b: (p, m) for b, p, m in git.worktrees}
+    wt_by_branch = {b: (p, m, lp) for b, p, m, lk, lp in git.worktrees}
     pr_branches = {pr.get("headRefName") for pr in prs.prs}
-    standalone_wts = [(b, p, m) for b, p, m in git.worktrees if b not in pr_branches]
+    standalone_wts = [(b, p, m, lp) for b, p, m, lk, lp in git.worktrees if b not in pr_branches]
     has_any = bool(prs.prs) or bool(standalone_wts)
     if prs.fetching and prs.last_fetch is None:
         v.append(_elapsed(prs.fetch_started), style="dim")
@@ -917,17 +964,19 @@ def _ops_body(
             v.append("▸  " if is_current else "   ")
             link_style = Style(link=pr_url) if pr_url else Style()
             if wt_entry:
-                wt_path, wt_merged = wt_entry
+                wt_path, wt_merged, wt_live_pid = wt_entry
                 v.append(f"#{pr['number']} {branch}", style=link_style)
                 if wt_merged:
                     v.append(" ✗", style="bold red")
+                if wt_live_pid is not None:
+                    v.append(f" [locked:{wt_live_pid}]", style="dim yellow")
                 v.append(f"  {_display_path(wt_path)}", style=Style(color="cyan", dim=True, link=f"file://{wt_path}"))
             else:
                 v.append(f"#{pr['number']} {pr['title'][:60]}", style=link_style)
                 if author:
                     v.append(f"  {author}", style="dim")
             row_idx += 1
-        for branch, path, merged in standalone_wts:
+        for branch, path, merged, live_pid in standalone_wts:
             is_current = branch == git.branch
             if row_idx > 0 or prs.fetching:
                 v.append("\n")
@@ -935,6 +984,8 @@ def _ops_body(
             v.append(branch, style="yellow")
             if merged:
                 v.append(" ✗", style="bold red")
+            if live_pid is not None:
+                v.append(f" [locked:{live_pid}]", style="dim yellow")
             v.append(f"  {_display_path(path)}", style=Style(color="cyan", dim=True, link=f"file://{path}"))
             row_idx += 1
         pr_sym = _sym("run") if prs.fetching else _sym("")
