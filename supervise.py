@@ -281,6 +281,7 @@ class Supervisor:
         self._mb_cache: dict[tuple[str, str], bool] = {}  # merge-base --is-ancestor results
         self._git_meta_mtimes: dict[str, float] = {}
         self._last_full_git_sweep: float = 0.0
+        self._merged_pr_branches: set[str] = set()  # headRefName of merged PRs, refreshed with self.prs
         self._pkg_info = _detect_package(target)  # (registry, name, local_version) or None
         if self._pkg_info:
             registry, name, local_version = self._pkg_info
@@ -350,10 +351,17 @@ class Supervisor:
     def _is_merged(self, branch: str, default_ref: str) -> bool:
         if branch == "(detached)":
             return False
+        with self._lock:
+            if branch in self._merged_pr_branches:
+                return True
         key = (branch, default_ref)
         cached = self._mb_cache.get(key)
         if cached is not None:
             return cached
+        # Ancestor check only catches fast-forward/merge-commit history — squash
+        # merges (GitHub's default) rewrite the branch onto a new commit on
+        # default_ref, so this is a fallback for non-PR merges; the GitHub-side
+        # merged-PR set above is what catches the common squash-merge case.
         rc, _, _ = run(
             ["git", "merge-base", "--is-ancestor", branch, default_ref],
             cwd=self.target,
@@ -534,8 +542,27 @@ class Supervisor:
         else:
             p.error = (err or "gh failed").strip().splitlines()[0]
 
+        # Squash/rebase merges rewrite history onto a new commit, so a local
+        # ancestor check never sees them as merged — ask GitHub directly for
+        # the branches it closed as merged, which is what actually happened.
+        merged_branches: Optional[set[str]] = None
+        mrc, mout, _ = run(
+            ["gh", "pr", "list", "--state", "merged", "--json", "headRefName", "--limit", "300"],
+            cwd=self.target,
+            timeout=20,
+        )
+        if mrc == 0:
+            try:
+                merged_branches = {row["headRefName"] for row in json.loads(mout)}
+            except Exception:
+                merged_branches = None
+
         with self._lock:
             self.prs = p
+            if merged_branches is not None:
+                self._merged_pr_branches = merged_branches
+        if merged_branches is not None:
+            self._git_wake.set()  # let the git loop re-check worktrees against the fresh set
         self._bump()
 
     def _pkg_loop(self):
